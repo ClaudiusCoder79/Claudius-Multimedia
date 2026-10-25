@@ -1,0 +1,86 @@
+name: Build Claudius Multimedia for Windows
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: write           # write is only used to attach files to a Release when a v* tag is pushed
+
+env:
+  APP: Claudius Multimedia
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+      - name: Check that all program files are present and compile
+        run: |
+          foreach ($f in "claudius_multimedia.py","cm_core.py","cm_icons.py","cm_theme.py","cm_tags.py","cm_parse.py","cm_online.py","cm_library.py","cm_player.py","cm_widgets.py","cm_dialogs.py","cm_main.py","splash.png","claudius.ico","FREEWARE.txt","LICENSE","README.txt","installer.iss","version_info.txt","lang\en.json","lang\pl.json","lang\de.json","lang\fr.json","lang\it.json","lang\es.json") { if (-not (Test-Path $f)) { throw "Missing file: $f" } }
+          python -m py_compile claudius_multimedia.py cm_core.py cm_icons.py cm_theme.py cm_tags.py cm_parse.py cm_online.py cm_library.py cm_player.py cm_widgets.py cm_dialogs.py cm_main.py
+      - name: Check translations (EN, PL, DE, FR, IT, ES)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/check_translations.py
+      - name: Build EXE
+        run: python -m PyInstaller --noconfirm --clean --noconsole --onedir --name "Claudius Multimedia" --icon claudius.ico --version-file version_info.txt --splash splash.png --add-data "lang;lang" --add-data "splash.png;." --add-data "FREEWARE.txt;." --add-data "claudius.ico;." --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtPdf claudius_multimedia.py
+      - name: Check the built program starts and plays a test tone
+        run: |
+          $exe = "dist\$env:APP\$env:APP.exe"
+          if (-not (Test-Path $exe)) { throw "The program was not built" }
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest=$report" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "The program did not finish its self-test in 90 seconds" }
+          if (-not (Test-Path $report)) { throw "The program did not start (no self-test report)" }
+          Get-Content $report
+          if (-not (Select-String -Path $report -Pattern "START OK" -Quiet)) { throw "Self-test failed" }
+          if (-not (Select-String -Path $report -Pattern "PLAYBACK OK" -Quiet)) { Write-Warning "Playback engine did not load the test tone (the build machine has no sound card) - check by hand" }
+          "{0:N0} MB" -f ((Get-ChildItem "dist\$env:APP" -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+      - name: Portable zip (unzip anywhere and start the EXE - no installation)
+        run: |
+          $v = (Select-String -Path cm_core.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          Compress-Archive -Path "dist\$env:APP" -DestinationPath "dist\Claudius-Multimedia-portable-$v.zip"
+          Get-ChildItem dist\*.zip | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Out-File dist\SHA256SUMS.txt -Encoding ascii
+          Get-Content dist\SHA256SUMS.txt
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: Claudius-Multimedia-windows-x64
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+      - name: Checksum of the installer
+        run: |
+          Get-ChildItem installer\*.exe | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Out-File dist\SHA256SUMS.txt -Encoding ascii -Append
+          Get-Content dist\SHA256SUMS.txt
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Claudius-Multimedia-installer
+          path: installer/*.exe
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            installer/*.exe
+          generate_release_notes: true

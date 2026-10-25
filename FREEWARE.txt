@@ -1,0 +1,36 @@
+Claudius Multimedia - freeware notice
+=====================================
+
+Claudius Multimedia is free for personal and commercial use. You may install it on as many
+computers as you like, use it at home or at work, and give it to other people - without paying.
+No ads, no bundled offers, no tracking.
+
+Created by Michal Czapla & Claude AI.
+Source code: https://github.com/ClaudiusCoder79/Claudius-Multimedia
+Licence: GNU General Public License v3 - see the file LICENSE.
+
+The program is provided "as is", without warranty of any kind. The authors are not liable for
+any damage or data loss that results from using it. Editing tags writes into your music files:
+keep a backup of music that matters to you.
+
+Online services
+---------------
+Covers, lyrics and MusicBrainz tags are looked up only when you ask for them, or - when
+"Download lyrics automatically" is on in Settings > Online - for the track that is playing.
+Only artist, album, title and track length are sent, to:
+  - LRCLIB            https://lrclib.net           (lyrics)
+  - MusicBrainz       https://musicbrainz.org      (tags, data CC0)
+  - Cover Art Archive https://coverartarchive.org  (covers)
+  - iTunes Search API https://itunes.apple.com     (covers)
+  - Deezer API        https://api.deezer.com       (covers)
+Turn all of this off in Settings > Online. Cover images and lyrics belong to their owners;
+they are downloaded for your personal use.
+
+Third-party components
+----------------------
+Claudius Multimedia is built with free software. Their licences apply to those parts:
+  - Qt 6 / PySide6 (Qt for Python)   GNU LGPL v3      https://www.qt.io
+  - FFmpeg (inside Qt Multimedia)    GNU LGPL v2.1+   https://ffmpeg.org
+  - Mutagen (audio tags)             GNU GPL v2+      https://github.com/quodlibet/mutagen
+  - Python                           PSF licence      https://www.python.org
+The complete source code of Claudius Multimedia is available at the GitHub address above.
