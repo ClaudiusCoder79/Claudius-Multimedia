@@ -1,8 +1,9 @@
 """Claudius Multimedia - dialogs: tag editor, cover / MusicBrainz / lyrics search, settings, rename, About page."""
 import os
 import re
+import time
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 import cm_icons
+import cm_library
 import cm_online
 import cm_tags
 import cm_theme
@@ -767,6 +769,9 @@ class SettingsDialog(Dialog):
         self.chk_queue = QCheckBox(tr("set.remember_queue"))
         self.chk_queue.setChecked(settings.get("remember_queue", True))
         pl.addWidget(self.chk_queue)
+        self.chk_resume = QCheckBox(tr("set.resume"))
+        self.chk_resume.setChecked(settings.get("resume", True))
+        pl.addWidget(self.chk_resume)
         pl.addSpacing(10)
         pl.addWidget(QLabel(f"<b>{tr('set.snapshots')}</b>"))
         row = QHBoxLayout()
@@ -800,6 +805,15 @@ class SettingsDialog(Dialog):
         self.chk_scan = QCheckBox(tr("set.scan_on_start"))
         self.chk_scan.setChecked(settings.get("scan_on_start", True))
         pl.addWidget(self.chk_scan)
+        self.chk_watch = QCheckBox(tr("set.watch"))
+        self.chk_watch.setChecked(settings.get("watch_folders", True))
+        pl.addWidget(self.chk_watch)
+        hid = QPushButton(cm_icons.glossy("undo", "orange", 18), tr("act.hidden_items") + "…")
+        hid.clicked.connect(lambda: hasattr(self.parent(), "show_hidden") and self.parent().show_hidden())
+        hrow = QHBoxLayout()
+        hrow.addWidget(hid)
+        hrow.addStretch(1)
+        pl.addLayout(hrow)
         self._page(tr("set.library"), "library", "blue", p)
 
         # online
@@ -887,7 +901,8 @@ class SettingsDialog(Dialog):
                 b.setChecked(b.mode == "system")
             for b in self.accent_group.buttons():
                 b.setChecked(b.colour == cm_theme.ACCENTS[0])
-            for c in (self.chk_queue, self.chk_scan, self.chk_online, self.chk_auto, self.chk_embed, self.chk_lrc):
+            for c in (self.chk_queue, self.chk_scan, self.chk_online, self.chk_auto, self.chk_embed, self.chk_lrc,
+                      self.chk_resume, self.chk_watch):
                 c.setChecked(True)
             self.snap.setText(default_snapshot_dir())
 
@@ -905,6 +920,8 @@ class SettingsDialog(Dialog):
         settings["library_folders"] = [self.folders.item(i).text() for i in range(self.folders.count())]
         self.removed_folders = [f for f in old if f not in settings["library_folders"]]
         settings["scan_on_start"] = self.chk_scan.isChecked()
+        settings["watch_folders"] = self.chk_watch.isChecked()
+        settings["resume"] = self.chk_resume.isChecked()
         settings["online"] = self.chk_online.isChecked()
         settings["auto_lyrics"] = self.chk_auto.isChecked()
         settings["embed_lyrics"] = self.chk_embed.isChecked()
@@ -925,7 +942,8 @@ SHORTCUTS = [("Space", "act.play"), ("Ctrl+O", "act.open_file"), ("Ctrl+Shift+O"
              ("S", "act.stop"), ("[ / ]", "sc.speed"), ("F11 / Enter", "act.fullscreen"), ("Esc", "sc.exit_full"),
              ("Ctrl+M", "act.mini"), ("Ctrl+T", "act.edit_tags"), ("Ctrl+L", "act.find_lyrics"),
              ("Ctrl+F", "sc.search"), ("Ctrl+S", "act.save_playlist"), ("F5", "act.rescan"), ("F12", "act.snapshot"),
-             ("Ctrl+,", "act.settings")]
+             ("Ctrl+,", "act.settings"), ("Home", "sc.start_over"), ("Del", "act.remove_lib"),
+             ("Shift+Del", "act.delete_files"), ("F2", "sc.rename"), ("Ctrl + wheel", "lib.tile_size")]
 
 
 def shortcuts_table():
@@ -939,6 +957,245 @@ def shortcuts_table():
         t.setItem(i, 0, QTableWidgetItem(key))
         t.setItem(i, 1, QTableWidgetItem(tr(act).replace("&", "")))
     return t
+
+
+class HiddenDialog(Dialog):
+    """Tools > Hidden items: tracks and videos taken out of the library (files untouched). Restore brings them
+    back with their ratings, play counts and playlist places."""
+    def __init__(self, parent):
+        super().__init__(parent, tr("hid.title"), "undo", "orange")
+        self.resize(940, 580)
+        self.changed = False
+        lay = QVBoxLayout(self)
+        note = muted(tr("hid.note"))
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText(tr("search.placeholder"))
+        self.filter.textChanged.connect(self._apply_filter)
+        lay.addWidget(self.filter)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([tr("col.title"), tr("col.artist"), tr("col.album"), tr("hid.when"),
+                                              tr("col.path")])
+        self.table.verticalHeader().hide()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        h = self.table.horizontalHeader()
+        for i, w in enumerate([220, 160, 170, 120]):
+            self.table.setColumnWidth(i, w)
+        h.setStretchLastSection(True)
+        lay.addWidget(self.table, 1)
+        self.count = muted()
+        restore = primary(tr("hid.restore"))
+        restore.clicked.connect(self._restore_selected)
+        restore_all = QPushButton(tr("hid.restore_all"))
+        restore_all.clicked.connect(self._restore_all)
+        close = QPushButton(tr("btn.close"))
+        close.clicked.connect(self.accept)
+        self.footer(lay, restore_all, restore, close, left=self.count)
+        self.load()
+
+    def load(self):
+        rows = cm_library.hidden_rows()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            when = time.strftime("%Y-%m-%d", time.localtime(r["hidden_at"])) if r.get("hidden_at") else ""
+            for j, v in enumerate([r.get("title") or os.path.basename(r["path"]), r.get("artist") or "",
+                                   r.get("album") or "", when, r["path"]]):
+                it = QTableWidgetItem(v)
+                it.setData(Qt.UserRole, r["path"])
+                self.table.setItem(i, j, it)
+        self.table.setSortingEnabled(True)
+        self.count.setText(tr("hid.count", n=len(rows)))
+        self._apply_filter(self.filter.text())
+
+    def _apply_filter(self, text):
+        words = text.lower().split()
+        for i in range(self.table.rowCount()):
+            line = " ".join((self.table.item(i, j).text() if self.table.item(i, j) else "") for j in range(5)).lower()
+            self.table.setRowHidden(i, not all(w in line for w in words))
+
+    def _paths(self, rows):
+        return [self.table.item(r, 0).data(Qt.UserRole) for r in rows if self.table.item(r, 0)]
+
+    def _restore_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if rows:
+            cm_library.unhide(self._paths(rows))
+            self.changed = True
+            self.load()
+
+    def _restore_all(self):
+        rows = [i for i in range(self.table.rowCount()) if not self.table.isRowHidden(i)]
+        if rows and QMessageBox.question(self, APP_NAME, tr("hid.restore_all_q", n=len(rows))) == QMessageBox.Yes:
+            cm_library.unhide(self._paths(rows))
+            self.changed = True
+            self.load()
+
+
+class BarList(QWidget):
+    """Horizontal bars, one hue, value written at the end of each bar (statistics)."""
+    def __init__(self, items, fmt=str, parent=None):
+        super().__init__(parent)
+        self.items = list(items)
+        self.fmt = fmt
+        self.setMinimumHeight(max(1, len(self.items)) * 26 + 4)
+
+    def paintEvent(self, _e):
+        from PySide6.QtGui import QFontMetrics, QPainter
+        c = cm_theme.colours()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fm = QFontMetrics(self.font())
+        if not self.items:
+            p.setPen(QColor(c["muted"]))
+            p.drawText(self.rect(), Qt.AlignLeft | Qt.AlignVCenter, tr("stats.nothing_yet"))
+            return
+        label_w = min(int(self.width() * 0.45), max(fm.horizontalAdvance(str(k)) for k, _v in self.items) + 12)
+        top = max(v for _k, v in self.items) or 1
+        val_w = max(fm.horizontalAdvance(self.fmt(v)) for _k, v in self.items) + 10
+        bar_room = max(10, self.width() - label_w - val_w - 4)
+        for i, (k, v) in enumerate(self.items):
+            y = i * 26 + 2
+            p.setPen(QColor(c["text"]))
+            p.drawText(QRectF(0, y, label_w - 8, 22), Qt.AlignLeft | Qt.AlignVCenter,
+                       fm.elidedText(str(k), Qt.ElideRight, label_w - 10))
+            w = max(3, bar_room * v / top)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(c["accent"]))
+            p.drawRoundedRect(QRectF(label_w, y + 6, w, 10), 4, 4)
+            p.setPen(QColor(c["muted"]))
+            p.drawText(QRectF(label_w + w + 6, y, val_w, 22), Qt.AlignLeft | Qt.AlignVCenter, self.fmt(v))
+
+
+class MonthChart(QWidget):
+    """Listening time per month: vertical bars, one hue, hover shows the exact time."""
+    def __init__(self, months, parent=None):
+        super().__init__(parent)
+        self.months = months
+        self.setMinimumHeight(190)
+        self.setMouseTracking(True)
+        self._bars = []
+
+    def paintEvent(self, _e):
+        from PySide6.QtCore import QLocale
+        from PySide6.QtGui import QPainter, QPen
+        c = cm_theme.colours()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        loc = QLocale(settings.get("language") or "en")
+        top = max((s for _y, _m, s in self.months), default=0)
+        base_y = self.height() - 24
+        avail_h = base_y - 22
+        n = max(1, len(self.months))
+        slot = self.width() / n
+        bw = min(34, slot * 0.6)
+        p.setPen(QPen(QColor(c["border"]), 1))
+        p.drawLine(0, base_y, self.width(), base_y)
+        self._bars = []
+        for i, (y, m, secs) in enumerate(self.months):
+            x = i * slot + (slot - bw) / 2
+            h = (avail_h * secs / top) if top else 0
+            if secs and h < 3:
+                h = 3
+            rect = QRectF(x, base_y - h, bw, h)
+            self._bars.append((rect.adjusted(-4, -avail_h, 4, 0), y, m, secs))
+            if h:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(c["accent"]))
+                p.drawRoundedRect(rect, 4, 4)
+                p.fillRect(QRectF(x, base_y - min(h, 4), bw, min(h, 4)), QColor(c["accent"]))
+            p.setPen(QColor(c["muted"]))
+            p.drawText(QRectF(i * slot, base_y + 4, slot, 18), Qt.AlignCenter, loc.monthName(m, QLocale.ShortFormat))
+        if top:
+            i = max(range(len(self.months)), key=lambda k: self.months[k][2])
+            r = self._bars[i][0]
+            p.setPen(QColor(c["text"]))
+            p.drawText(QRectF(r.left() - 30, base_y - avail_h * self.months[i][2] / top - 20, r.width() + 60, 18),
+                       Qt.AlignCenter, _hours(self.months[i][2]))
+        if not top:
+            p.setPen(QColor(c["muted"]))
+            p.drawText(QRectF(0, 0, self.width(), base_y), Qt.AlignCenter, tr("stats.nothing_yet"))
+
+    def mouseMoveEvent(self, e):
+        from PySide6.QtCore import QLocale
+        from PySide6.QtWidgets import QToolTip
+        loc = QLocale(settings.get("language") or "en")
+        for rect, y, m, secs in self._bars:
+            if rect.contains(e.position()):
+                QToolTip.showText(e.globalPosition().toPoint(), f"{loc.monthName(m)} {y}: {_hours(secs)}", self)
+                return
+        QToolTip.hideText()
+
+
+def _hours(secs):
+    secs = int(secs or 0)
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"{h} h {m:02d} min" if h else f"{m} min"
+
+
+class StatsDialog(Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, tr("stats.title"), "eq", "green")
+        self.resize(980, 720)
+        s = cm_library.statistics()
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(14)
+        tiles = QGridLayout()
+        tiles.setSpacing(10)
+        cards = [("stats.tracks", f'{s["music"]:,}'.replace(",", " ")), ("stats.albums", f'{s["albums"]:,}'.replace(",", " ")),
+                 ("stats.artists", f'{s["artists"]:,}'.replace(",", " ")), ("stats.videos", f'{s["videos"]:,}'.replace(",", " ")),
+                 ("stats.size", f'{s["size"] / 1073741824:.1f} GB'), ("stats.length", _hours(s["duration"])),
+                 ("stats.plays", f'{s["plays"]:,}'.replace(",", " ")), ("stats.listened", _hours(s["listened"]))]
+        for i, (key, val) in enumerate(cards):
+            card = QFrame()
+            card.setObjectName("Card")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(14, 10, 14, 10)
+            v = QLabel(val)
+            v.setStyleSheet("font-size: 17pt; font-weight: 700; background: transparent;")
+            k = muted(tr(key))
+            k.setStyleSheet("background: transparent;")
+            cl.addWidget(v)
+            cl.addWidget(k)
+            tiles.addWidget(card, i // 4, i % 4)
+        lay.addLayout(tiles)
+        lay.addWidget(self._h(tr("stats.per_month")))
+        lay.addWidget(MonthChart(s["months"]))
+        since = s.get("history_since")
+        lay.addWidget(muted(tr("stats.history_since", date=time.strftime("%Y-%m-%d", time.localtime(since)))
+                            if since else tr("stats.history_note")))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(28)
+        grid.setVerticalSpacing(6)
+        plays = lambda v: tr("stats.n_plays", n=v)
+        for i, (key, items) in enumerate((("stats.top_artists", s["top_artists"]), ("stats.top_tracks", s["top_tracks"]),
+                                          ("stats.top_albums", s["top_albums"]), ("stats.top_genres", s["top_genres"]))):
+            col = QVBoxLayout()
+            col.addWidget(self._h(tr(key)))
+            col.addWidget(BarList(items, plays))
+            col.addStretch(1)
+            grid.addLayout(col, i // 2, i % 2)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        ok = primary(tr("btn.close"))
+        ok.clicked.connect(self.accept)
+        self.footer(outer, ok)
+
+    def _h(self, text):
+        lab = QLabel(text)
+        lab.setObjectName("H1")
+        return lab
 
 
 class TextDialog(Dialog):

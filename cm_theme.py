@@ -56,7 +56,7 @@ QPushButton#TabBtn:hover {{ background: {hover}; }}
 QPushButton#TabBtn:checked {{ background: {accentSoft}; color: {accent}; font-weight: 700; }}
 QPushButton#Round {{ border: none; background: transparent; padding: 0; }}
 QPushButton#Round:hover {{ background: {hover}; border-radius: 15px; }}
-QLineEdit#Search {{ border: 1px solid {border}; border-radius: 15px; padding: 5px 12px; background: {panel}; min-width: 220px; }}
+QLineEdit#Search {{ border: 1px solid {border}; border-radius: 15px; padding: 5px 12px; background: {panel}; min-width: 150px; max-width: 260px; }}
 #Ribbon {{ background: {ribbon}; border-bottom: 1px solid {border}; }}
 #RibbonGroupLabel {{ color: {muted}; font-size: 8pt; }}
 QToolButton#RibbonBtn {{ border: none; border-radius: 7px; padding: 3px 2px 2px 2px; min-width: 60px; font-size: 8.5pt; background: transparent; }}
@@ -92,6 +92,13 @@ QListView#AlbumStrip {{ background: {panel}; border: none; border-bottom: 1px so
 QListView#AlbumStrip::item {{ border-radius: 8px; padding: 4px; color: {text}; }}
 QListView#AlbumStrip::item:selected {{ background: {sel}; color: {text}; }}
 QListView#AlbumStrip::item:hover {{ background: {hover}; }}
+#LibBar {{ background: {panel}; border-bottom: 1px solid {border}; }}
+#BarTitle {{ font-weight: 700; font-size: 10.5pt; }}
+QTreeWidget#FolderTree {{ background: {panel2}; border: none; border-right: 1px solid {border}; outline: none; }}
+QTreeWidget#FolderTree::item {{ padding: 4px 2px; }}
+QTreeWidget#FolderTree::item:selected {{ background: {sel}; color: {text}; }}
+QTreeWidget, QTableWidget {{ background: {panel}; border: 1px solid {border}; border-radius: 6px; outline: none;
+                             selection-background-color: {sel}; selection-color: {text}; }}
 QListWidget {{ background: {panel}; border: 1px solid {border}; border-radius: 6px; outline: none; }}
 QListWidget::item {{ padding: 4px 6px; }}
 QListWidget::item:selected {{ background: {sel}; color: {text}; }}
@@ -111,9 +118,13 @@ QSlider::handle:horizontal {{ width: 13px; height: 13px; margin: -5px 0; border-
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{ background: {input}; border: 1px solid {border};
      border-radius: 6px; padding: 5px 8px; selection-background-color: {accent}; selection-color: #fff; }}
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border: 1px solid {accent}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox::down-arrow {{ width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent;
-                        border-top: 6px solid {muted}; margin-right: 8px; }}
+QComboBox::drop-down {{ border: none; width: 24px; }}
+QComboBox::down-arrow {{ image: url("{arrow_down}"); width: 10px; height: 10px; margin-right: 6px; }}
+QSpinBox, QDoubleSpinBox {{ padding-right: 20px; }}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; width: 20px; border: none; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; width: 20px; border: none; }}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url("{arrow_up}"); width: 9px; height: 9px; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: url("{arrow_down}"); width: 9px; height: 9px; }}
 QComboBox QAbstractItemView {{ background: {panel}; border: 1px solid {border}; selection-background-color: {sel}; selection-color: {text}; }}
 QPushButton {{ background: {panel2}; border: 1px solid {border}; border-radius: 6px; padding: 6px 14px; }}
 QPushButton:hover {{ background: {hover}; }}
@@ -144,9 +155,27 @@ QProgressBar::chunk {{ background: {accent}; border-radius: 3px; }}
 """
 
 
+def _arrow_files(colour):
+    """Small arrow images for combo / spin boxes (style sheets can only draw arrows from files)."""
+    import os
+    from cm_core import data_dir
+    folder = os.path.join(data_dir(), "theme")
+    os.makedirs(folder, exist_ok=True)
+    out = {}
+    for name, path in (("down", "M2 4l4 4 4-4"), ("up", "M2 8l4-4 4 4")):
+        fn = os.path.join(folder, f"arrow-{name}-{colour.lstrip('#')}.svg")
+        if not os.path.isfile(fn):
+            with open(fn, "w", encoding="utf-8") as fh:
+                fh.write(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="{path}" fill="none" '
+                         f'stroke="{colour}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+        out["arrow_" + name] = fn.replace("\\", "/")
+    return out
+
+
 def apply(app=None):
     app = app or QApplication.instance()
     c = colours()
+    c.update(_arrow_files(c["muted"]))
     app.setStyle("Fusion")
     pal = QPalette()
     pal.setColor(QPalette.Window, QColor(c["bg"]))

@@ -1,14 +1,18 @@
 """Claudius Multimedia - main window."""
 import os
+import random
+import re
+import sqlite3
 import sys
 import time
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-                               QSplitter, QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
-from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtCore import QByteArray, QFileSystemWatcher, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import (QActionGroup, QColor, QDesktopServices, QIcon, QImage, QKeySequence, QLinearGradient,
+                           QPainter, QPixmap, QShortcut, QStandardItem)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QComboBox, QFileDialog, QHBoxLayout,
+                               QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+                               QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTabWidget, QToolButton,
+                               QVBoxLayout, QWidget)
 
 import cm_dialogs
 import cm_icons
@@ -20,10 +24,11 @@ import cm_widgets
 from cm_core import (APP_NAME, APP_URL, LANGUAGES, MEDIA_EXT, PLAYLIST_EXT, SUBTITLE_EXT, fmt_time,
                      is_media, is_url, is_video, set_language, settings, tr)
 from cm_parse import parse_subtitles, read_playlist, read_text, subtitle_at, write_m3u
-from cm_player import Player
+from cm_player import Player, ThumbnailMaker
 from cm_widgets import bind, muted
 
-TABS = ["file", "home", "playback", "library", "tags", "lyrics", "playlist", "view", "about"]
+TABS = ["file", "home", "playback", "library", "tags", "lyrics", "playlist", "tools", "view", "about"]
+RESUME_MIN_MS = 20 * 60 * 1000      # audio longer than this (audiobooks, podcasts, mixes) also continues where it stopped
 
 RIBBONS = {
     "file": [("open", ["open_file", "open_folder", "open_url"]),
@@ -41,10 +46,10 @@ RIBBONS = {
                  ("speed", ["slower", "speed", "faster"]),
                  ("sound", ["mute", "voldown", "volup"])],
     "library": [("library", ["add_folder", "rescan", "folders"]),
-                ("browse", ["browse_artists", "browse_albums", "browse_genres", "browse_tracks"]),
-                ("tags", ["edit_tags", "find_cover", "find_lyrics"]),
-                ("batch", ["batch_covers", "batch_lyrics"]),
-                ("playlists", ["new_playlist", "add_to_playlist"])],
+                ("browse", ["browse_artists", "browse_albums", "browse_genres", "browse_folders", "browse_tracks"]),
+                ("layout", ["album_grid"]),
+                ("selection", ["edit_tags", "find_cover", "remove_lib", "delete_files"]),
+                ("playlists", ["new_playlist", "new_smart", "add_to_playlist"])],
     "tags": [("edit", ["edit_tags", "mb_lookup", "tags_from_name"]),
              ("artwork", ["find_cover", "cover_from_file", "remove_cover", "export_cover"]),
              ("batch", ["batch_covers", "rename_files"])],
@@ -53,7 +58,10 @@ RIBBONS = {
     "playlist": [("queue", ["queue_add_files", "queue_add_folder", "queue_remove", "clear_queue"]),
                  ("order", ["queue_shuffle", "queue_sort"]),
                  ("file", ["load_playlist", "save_playlist"]),
-                 ("playlists", ["new_playlist", "add_to_playlist"])],
+                 ("playlists", ["new_playlist", "new_smart", "add_to_playlist"])],
+    "tools": [("cleanup", ["duplicates", "missing_files", "hidden_items"]),
+              ("batch", ["batch_covers", "batch_lyrics", "rename_files"]),
+              ("library", ["statistics", "watch_folders", "backup", "restore"])],
     "view": [("theme", ["theme_system", "theme_light", "theme_dark"]),
              ("language", ["language"]),
              ("show", ["show_library", "show_nowplaying", "toggle_sidebar", "toggle_right"]),
@@ -76,8 +84,21 @@ class MainWindow(QMainWindow):
         self.current_info = {}
         self.current_lyrics_source = ""
         self.view = ("music", None)       # sidebar selection
-        self.browse = "albums"
+        self.browse = settings.get("browse", "albums")
+        if self.browse not in ("artists", "albums", "genres", "folders", "tracks"):
+            self.browse = "albums"
         self.browse_value = None
+        self.watch_task = None
+        self._pending_dirs = set()
+        self._listen_acc = 0
+        self._listen_last = None
+        self.thumbnailer = ThumbnailMaker(self)
+        self.thumbnailer.ready.connect(self._video_thumb_ready)
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.directoryChanged.connect(self._dir_changed)
+        self.watch_timer = QTimer(self, singleShot=True, interval=4000, timeout=self._watch_scan)
+        self.periodic_timer = QTimer(self, interval=10 * 60 * 1000, timeout=self._periodic_scan)
+        self._last_quiet_scan = time.monotonic()
         self.batch_task = None
         self._prev_page = 0
         self._mini_geometry = None
@@ -111,6 +132,7 @@ class MainWindow(QMainWindow):
         self._show_track(-1)
         self.save_timer = QTimer(self, interval=60000, timeout=self._save_state)
         self.save_timer.start()
+        QTimer.singleShot(3000, self.setup_watch)
 
     # ================================================================ actions
     def _build_actions(self):
@@ -152,8 +174,19 @@ class MainWindow(QMainWindow):
         mk("rescan", "scan", "blue", self.rescan, "F5")
         mk("folders", "library", "blue", lambda: self.open_settings(2))
         for aid, glyph in (("browse_artists", "user"), ("browse_albums", "album"), ("browse_genres", "grid"),
-                           ("browse_tracks", "list")):
+                           ("browse_folders", "open"), ("browse_tracks", "list")):
             mk(aid, glyph, "green", lambda _=False, m=aid.split("_")[1]: self.set_browse(m), None, True)
+        mk("album_grid", "grid", "teal", lambda on: self.set_album_view("grid" if on else "strip"), None, True)
+        mk("remove_lib", "remove", "gray", lambda: self.remove_from_library(self.target_paths(library_only=True)))
+        mk("delete_files", "trash", "red", lambda: self.delete_files(self.target_paths(library_only=True)))
+        mk("new_smart", "star", "teal", lambda: self.edit_smart(None))
+        mk("duplicates", "grid", "orange", self.show_duplicates)
+        mk("missing_files", "search", "orange", self.show_missing)
+        mk("hidden_items", "undo", "orange", self.show_hidden)
+        mk("statistics", "eq", "green", self.show_statistics)
+        mk("watch_folders", "scan", "green", self.toggle_watch, None, True)
+        mk("backup", "save", "blue", self.backup_library)
+        mk("restore", "export", "blue", self.restore_library)
         mk("edit_tags", "tag", "orange", self.edit_tags, "Ctrl+T")
         mk("mb_lookup", "star", "orange", self.mb_lookup)
         mk("tags_from_name", "list", "orange", self.tags_from_name)
@@ -196,9 +229,11 @@ class MainWindow(QMainWindow):
             g.addAction(A[k])
         A["theme_" + settings.get("theme", "system")].setChecked(True)
         g2 = QActionGroup(self)
-        for k in ("browse_artists", "browse_albums", "browse_genres", "browse_tracks"):
+        for k in ("browse_artists", "browse_albums", "browse_genres", "browse_folders", "browse_tracks"):
             g2.addAction(A[k])
-        A["browse_albums"].setChecked(True)
+        A["browse_" + self.browse].setChecked(True)
+        A["album_grid"].setChecked(settings.get("album_view") == "grid")
+        A["watch_folders"].setChecked(bool(settings.get("watch_folders", True)))
         A["shuffle"].setChecked(self.player.shuffle)
         A["mute"].setChecked(bool(settings.get("muted")))
         A["toggle_sidebar"].setChecked(settings.get("show_sidebar", True))
@@ -240,6 +275,7 @@ class MainWindow(QMainWindow):
         sc("Return", self._enter)
         sc("Escape", self._escape)
         sc("Ctrl+F", lambda: (self.header.search.setFocus(), self.header.search.selectAll()))
+        sc("Home", self._start_over)
         sc("Media Play", self.player.toggle)
         sc("Media Next", lambda: self.player.next())
         sc("Media Previous", self.player.previous)
@@ -292,6 +328,7 @@ class MainWindow(QMainWindow):
         self.sidelist = cm_widgets.SideList()
         self.sidelist.itemClicked.connect(self._side_clicked)
         self.sidelist.customContextMenuRequested.connect(self._side_menu)
+        self.sidelist.tracksDropped.connect(self._side_drop)
         sl.addWidget(self.sidelist)
         self.side.setMinimumWidth(190)
         self.body.addWidget(self.side)
@@ -343,11 +380,8 @@ class MainWindow(QMainWindow):
         self.info_lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.info_lab.setContentsMargins(4, 10, 4, 4)
         self.rtabs.addTab(self.info_lab, "")
-        self.queue = QListWidget()
-        self.queue.setObjectName("Queue")
-        self.queue.setDragDropMode(QAbstractItemView.InternalMove)
-        self.queue.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.queue.setIconSize(QSize(36, 36))
+        self.queue = cm_widgets.QueueList()
+        self.queue.tracksDropped.connect(self._queue_drop)
         self.queue.itemDoubleClicked.connect(lambda it: self.player.play_index(self.queue.row(it)))
         self.queue.model().rowsMoved.connect(self._queue_moved)
         self.queue.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -406,20 +440,89 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-        self.album_model = QStandardItemModel(self)
-        self.albums = cm_widgets.AlbumStrip()
-        self.albums.setModel(self.album_model)
-        self.albums.clicked.connect(self._album_clicked)
-        self.albums.doubleClicked.connect(lambda idx: (self._album_clicked(idx), self.play_rows(0)))
-        v.addWidget(self.albums)
-        h = QHBoxLayout()
+        self.lib_layout = v
+        # bar above albums / videos: back to the grid, title, sort, tile size, strip / grid
+        self.lib_bar = QWidget()
+        self.lib_bar.setObjectName("LibBar")
+        self.lib_bar.setAttribute(Qt.WA_StyledBackground, True)
+        self.lib_bar.setFixedHeight(42)
+        bl = QHBoxLayout(self.lib_bar)
+        bl.setContentsMargins(10, 4, 12, 4)
+        bl.setSpacing(8)
+        self.b_back = QToolButton()
+        self.b_back.setObjectName("Flat")
+        self.b_back.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        bind(self.b_back, "lib.all_albums")
+        self.b_back.clicked.connect(self._back_to_grid)
+        bl.addWidget(self.b_back)
+        self.bar_title = QLabel()
+        self.bar_title.setObjectName("BarTitle")
+        bl.addWidget(self.bar_title)
+        bl.addStretch(1)
+        self.sort_label = muted()
+        bind(self.sort_label, "lib.sort")
+        bl.addWidget(self.sort_label)
+        self.sort_combo = QComboBox()
+        self.sort_combo.setMinimumWidth(150)
+        self._fill_sort_combo()
+        self.sort_combo.currentIndexChanged.connect(self._album_sort_changed)
+        bl.addWidget(self.sort_combo)
+        bl.addSpacing(10)
+        self.size_icon = QLabel()
+        bl.addWidget(self.size_icon)
+        self.size_slider = QSlider(Qt.Horizontal)
+        self.size_slider.setRange(72, 260)
+        self.size_slider.setFixedWidth(110)
+        self.size_slider.setValue(int(settings.get("tile_size", 124)))
+        self.size_slider.valueChanged.connect(self._tile_size_changed)
+        bind(self.size_slider, "lib.tile_size", "setToolTip")
+        bl.addWidget(self.size_slider)
+        bl.addSpacing(6)
+        self.b_strip = QToolButton()
+        self.b_grid = QToolButton()
+        grp = QButtonGroup(self)
+        for b, mode, key in ((self.b_strip, "strip", "lib.view_strip"), (self.b_grid, "grid", "lib.view_grid")):
+            b.setObjectName("Flat")
+            b.setCheckable(True)
+            b.setIconSize(QSize(18, 18))
+            b.setChecked(settings.get("album_view", "strip") == mode)
+            bind(b, key, "setToolTip")
+            b.clicked.connect(lambda _=False, m=mode: self.set_album_view(m))
+            grp.addButton(b)
+            bl.addWidget(b)
+        v.addWidget(self.lib_bar)
+
+        self.tile_model = cm_widgets.TileModel(self)
+        self.tile_model.resolver = self._tile_paths
+        self.tiles = cm_widgets.TileView()
+        self.tiles.setModel(self.tile_model)
+        self.tiles.configure(mode=settings.get("album_view", "strip"), tile=settings.get("tile_size", 124))
+        self.tiles.clicked.connect(self._tile_clicked)
+        self.tiles.doubleClicked.connect(self._tile_activated)
+        self.tiles.customContextMenuRequested.connect(self._tile_menu)
+        self.tiles.removeRequested.connect(lambda: self.remove_from_library(self._tile_selected_paths()))
+        self.tiles.trashRequested.connect(lambda: self.delete_files(self._tile_selected_paths()))
+        self.tiles.tileSizeChanged.connect(lambda v: self.size_slider.setValue(v))
+        self.tiles.setItemDelegate(cm_widgets.TileDelegate(self.tiles))
+        v.addWidget(self.tiles)
+
+        self.lower = QWidget()
+        h = QHBoxLayout(self.lower)
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
         self.group_list = QListWidget()
         self.group_list.setObjectName("SideList")
         self.group_list.setFixedWidth(230)
         self.group_list.itemClicked.connect(self._group_clicked)
+        self.group_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.group_list.customContextMenuRequested.connect(self._group_menu)
         self.group_list.hide()
         h.addWidget(self.group_list)
+        self.folder_tree = cm_widgets.FolderTree()
+        self.folder_tree.itemClicked.connect(self._folder_clicked)
+        self.folder_tree.customContextMenuRequested.connect(self._folder_menu)
+        self.folder_tree.hide()
+        h.addWidget(self.folder_tree)
         inner = QVBoxLayout()
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(0)
@@ -446,15 +549,30 @@ class MainWindow(QMainWindow):
         self.b_shuffle_all = QPushButton()
         bind(self.b_shuffle_all, "btn.shuffle_all")
         self.b_shuffle_all.clicked.connect(lambda: self.play_rows(0, shuffle=True))
+        self.b_extra = QPushButton()
+        self.b_extra.clicked.connect(self._head_extra)
         self.b_tags_all = QPushButton()
         bind(self.b_tags_all, "act.edit_tags")
         self.b_tags_all.clicked.connect(lambda: self.edit_tags(all_rows=True))
-        for b in (self.b_play_all, self.b_shuffle_all, self.b_tags_all):
+        self.b_more = QPushButton("⋯")
+        self.b_more.setFixedWidth(42)
+        bind(self.b_more, "lib.more", "setToolTip")
+        self.b_more.clicked.connect(lambda: self._track_menu(
+            self.table.model_.rows, self.b_more.mapToGlobal(self.b_more.rect().bottomLeft()), source="head"))
+        for b in (self.b_play_all, self.b_shuffle_all, self.b_extra, self.b_tags_all, self.b_more):
             ah.addWidget(b)
         inner.addWidget(self.album_head)
         self.table = cm_widgets.TrackTable()
-        self.table.doubleClicked.connect(lambda idx: self.play_rows(idx.row()))
+        if settings.get("table_header"):
+            self.table.restore_layout(settings["table_header"])
+        self.table.layoutSaved.connect(lambda s: settings.__setitem__("table_header", s))
+        self.table.model_.edit_hook = self._edit_cell
+        self.table.doubleClicked.connect(self._table_activated)
         self.table.customContextMenuRequested.connect(self._table_menu)
+        self.table.ratingClicked.connect(self._rate_row)
+        self.table.favClicked.connect(lambda row: self._set_fav([row["path"]], not row.get("favourite")))
+        self.table.removeRequested.connect(lambda: self.remove_from_library(self.table.selected_paths()))
+        self.table.trashRequested.connect(lambda: self.delete_files(self.table.selected_paths()))
         inner.addWidget(self.table, 1)
         self.empty = QLabel()
         self.empty.setAlignment(Qt.AlignCenter)
@@ -463,14 +581,24 @@ class MainWindow(QMainWindow):
         self.empty.hide()
         inner.addWidget(self.empty, 1)
         h.addLayout(inner, 1)
-        v.addLayout(h, 1)
+        v.addWidget(self.lower, 1)
         return page
+
+    def _fill_sort_combo(self):
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.clear()
+        for key in cm_library.ALBUM_SORTS:
+            self.sort_combo.addItem(tr("sort." + key), key)
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(settings.get("album_sort", "artist"))))
+        self.sort_combo.blockSignals(False)
 
     def _retranslate_local(self):
         for i, key in enumerate(("panel.lyrics", "panel.info", "panel.queue")):
             self.rtabs.setTabText(i, tr(key))
-        self.table.model_.headerDataChanged.emit(Qt.Horizontal, 0, len(self.table.model_.COLS) - 1)
+        self.table.model_.headerDataChanged.emit(Qt.Horizontal, 0, len(cm_widgets.COLUMNS) - 1)
         self.empty.setText(tr("lib.empty"))
+        if hasattr(self, "sort_combo"):
+            self._fill_sort_combo()
 
     # ================================================================ theme / language
     def set_theme(self, mode):
@@ -488,7 +616,7 @@ class MainWindow(QMainWindow):
         self._refresh_icons()
         self.lyrics._restyle()
         self.reload_sidebar()
-        self.table.viewport().update()
+        self.reload_library(keep=True)
 
     def _refresh_icons(self):
         self.transport.refresh_icons()
@@ -500,6 +628,7 @@ class MainWindow(QMainWindow):
         self._retranslate_local()
         self.about.build()
         self.reload_sidebar()
+        self.reload_library(keep=True)
         self._update_stats()
         self._update_modes()
         self._show_info()
@@ -676,6 +805,9 @@ class MainWindow(QMainWindow):
         p.error.connect(self._play_error)
         p.finished.connect(lambda path, dur: cm_library.played(path, dur / 1000))
         p.tracksChanged.connect(self._tracks_changed)
+        p.leaving.connect(self._leaving)
+        p.resumed.connect(self._resumed)
+        p.resume_lookup = self._resume_lookup
         p.mp.hasVideoChanged.connect(self._has_video)
         p.mp.setVideoOutput(self.video.video)
         try:
@@ -697,6 +829,12 @@ class MainWindow(QMainWindow):
             self.st_state.setText(("▶ " + tr("st.playing")) if self.player.is_playing() else ("❚❚ " + tr("st.paused")))
 
     def _position(self, ms):
+        if self.player.is_playing():
+            if self._listen_last is not None and 0 < ms - self._listen_last < 1500:
+                self._listen_acc += ms - self._listen_last
+            self._listen_last = ms
+        else:
+            self._listen_last = None
         self.lyrics.update_position(ms)
         if self.subs:
             self._set_sub(subtitle_at(self.subs, ms))
@@ -1165,28 +1303,41 @@ class MainWindow(QMainWindow):
                 self.player.set_queue(q, idx, play=False)
 
     # ================================================================ library
+    # ---------------------------------------------------------------- sidebar
     def reload_sidebar(self):
         self.sidelist.clear()
         counts = cm_library.counts()
         sel = self.view
         L = self.sidelist
+        c = cm_theme.colours()
         L.heading("side.library")
-        items = [("music", "lyrics", "blue"), ("videos", "video", "purple"), ("favourites", "heartf", "red")]
-        for key, glyph, colour in items:
+        for key, glyph, colour in (("music", "lyrics", "blue"), ("videos", "video", "purple"), ("favourites", "heartf", "red")):
             it = L.entry(tr("side." + key), cm_icons.glossy(glyph, colour, 22), ("view", key), counts.get(key))
             if sel == (key, None):
                 it.setSelected(True)
         L.heading("side.smart")
-        for key, glyph in (("recent", "clock"), ("most", "star"), ("nocover", "image"), ("nolyrics", "lyrics")):
-            it = L.entry(tr("side." + key), cm_icons.flat(glyph, cm_theme.colours()["muted"], 20), ("view", key), counts.get(key))
+        smart = [("recent", "clock"), ("most", "star"), ("nocover", "image"), ("nolyrics", "lyrics")]
+        if counts.get("missing"):
+            smart.append(("missing", "info"))
+        for key, glyph in smart:
+            warn = key == "missing"
+            it = L.entry(tr("side." + key), cm_icons.flat(glyph, "#d97706" if warn else c["muted"], 20), ("view", key),
+                         counts.get(key), warn=warn)
             if sel == (key, None):
                 it.setSelected(True)
         L.heading("side.playlists")
+        for sid, name, _spec in cm_library.smart_playlists():
+            it = L.entry(name, cm_icons.flat("star", c["accent"], 20), ("smart", sid))
+            it.setToolTip(tr("smart.tip"))
+            if sel == ("smart", sid):
+                it.setSelected(True)
         for pid, name, n in cm_library.playlists():
-            it = L.entry(name, cm_icons.flat("playlist", cm_theme.colours()["muted"], 20), ("playlist", pid), n)
+            it = L.entry(name, cm_icons.flat("playlist", c["muted"], 20), ("playlist", pid), n)
+            it.setToolTip(tr("pl.drop_tip"))
             if sel == ("playlist", pid):
                 it.setSelected(True)
-        L.entry(tr("act.new_playlist"), cm_icons.flat("add", cm_theme.colours()["accent"], 20), ("newpl", None))
+        L.entry(tr("act.new_playlist"), cm_icons.flat("add", c["accent"], 20), ("newpl", None))
+        L.entry(tr("act.new_smart"), cm_icons.flat("star", c["accent"], 20), ("newsmart", None))
 
     def _side_clicked(self, it):
         data = it.data(Qt.UserRole)
@@ -1196,24 +1347,70 @@ class MainWindow(QMainWindow):
         if kind == "newpl":
             self.new_playlist()
             return
-        self.view = (value, None) if kind == "view" else ("playlist", value)
+        if kind == "newsmart":
+            self.edit_smart(None)
+            return
+        self.view = (value, None) if kind == "view" else (kind, value)
         self.browse_value = None
+        self.table.clear_sort()
         self.show_page(0)
         self.reload_library()
 
     def _side_menu(self, pos):
         it = self.sidelist.itemAt(pos)
         data = it.data(Qt.UserRole) if it else None
-        if not data or data[0] != "playlist":
+        if not data:
             return
-        pid = data[1]
+        kind, value = data
         m = QMenu(self)
-        m.addAction(tr("act.play"), lambda: self.player.set_queue([r["path"] for r in cm_library.query(playlist=pid)]))
-        m.addAction(tr("pl.rename"), lambda: self._rename_pl(pid))
-        m.addAction(tr("pl.export"), lambda: self._export_pl(pid))
-        m.addSeparator()
-        m.addAction(tr("pl.delete"), lambda: self._delete_pl(pid))
+        if kind == "playlist":
+            pid = value
+            m.addAction(cm_icons.glossy("play", "green", 20), tr("act.play"),
+                        lambda: self._play_list(cm_library.query(playlist=pid)))
+            m.addAction(tr("btn.shuffle_all"), lambda: self._play_list(cm_library.query(playlist=pid), shuffle=True))
+            m.addSeparator()
+            m.addAction(tr("pl.rename"), lambda: self._rename_pl(pid))
+            m.addAction(tr("pl.export"), lambda: self._export_pl(pid))
+            m.addSeparator()
+            m.addAction(tr("pl.delete"), lambda: self._delete_pl(pid))
+        elif kind == "smart":
+            sid = value
+            m.addAction(cm_icons.glossy("play", "green", 20), tr("act.play"), lambda: self._play_list(self._smart_rows(sid)))
+            m.addAction(tr("btn.shuffle_all"), lambda: self._play_list(self._smart_rows(sid), shuffle=True))
+            m.addSeparator()
+            m.addAction(cm_icons.glossy("edit", "purple", 20), tr("smart.edit"), lambda: self.edit_smart(sid))
+            m.addAction(tr("smart.to_playlist"), lambda: self._smart_to_playlist(sid))
+            m.addAction(tr("pl.export"), lambda: self._export_rows(self._smart_rows(sid), (cm_library.get_smart(sid) or (0, "smart"))[1]))
+            m.addSeparator()
+            m.addAction(tr("pl.delete"), lambda: self._delete_smart(sid))
+        elif kind == "view":
+            m.addAction(cm_icons.glossy("play", "green", 20), tr("act.play"), lambda: self._play_list(cm_library.query(value)))
+            m.addAction(tr("btn.shuffle_all"), lambda: self._play_list(cm_library.query(value), shuffle=True))
+            if value == "missing":
+                m.addSeparator()
+                m.addAction(tr("lib.forget_missing"), self.forget_missing)
+        else:
+            return
         m.exec(self.sidelist.mapToGlobal(pos))
+
+    def _side_drop(self, data, paths):
+        kind, value = data
+        paths = [p for p in paths if not is_url(p)]
+        if not paths:
+            return
+        if kind == "playlist":
+            name = next((n for i, n, _ in cm_library.playlists() if i == value), "")
+            self._add_to_pl(value, name, paths)
+        elif kind == "newpl":
+            self.new_playlist(paths)
+        elif data == ("view", "favourites"):
+            self._set_fav(paths, True)
+            self.message(tr("msg.fav_added", n=len(paths)))
+
+    def _queue_drop(self, paths, row):
+        paths = [p for p in paths if not is_url(p) and os.path.isfile(p)]
+        if paths:
+            self.player.insert(paths, row)
 
     def _rename_pl(self, pid):
         old = next((n for i, n, _ in cm_library.playlists() if i == pid), "")
@@ -1223,11 +1420,15 @@ class MainWindow(QMainWindow):
             self.reload_sidebar()
 
     def _export_pl(self, pid):
-        rows = cm_library.query(playlist=pid)
         name = next((n for i, n, _ in cm_library.playlists() if i == pid), "playlist")
+        self._export_rows(cm_library.query(playlist=pid), name)
+
+    def _export_rows(self, rows, name):
         fn, _ = QFileDialog.getSaveFileName(self, tr("pl.export"), name + ".m3u8", "M3U8 (*.m3u8)")
         if fn:
-            write_m3u(fn, [(r["path"], f'{r["artist"]} - {r["title"]}', r["duration"]) for r in rows])
+            write_m3u(fn, [(r["path"], f'{r["artist"]} - {r["title"]}' if r.get("artist") else r["title"], r["duration"])
+                           for r in rows])
+            self.message(tr("msg.saved", name=os.path.basename(fn)))
 
     def _delete_pl(self, pid):
         if QMessageBox.question(self, APP_NAME, tr("pl.delete_q")) == QMessageBox.Yes:
@@ -1244,167 +1445,538 @@ class MainWindow(QMainWindow):
             paths = paths if isinstance(paths, list) else None
             if paths:
                 cm_library.add_to_playlist(pid, [p for p in paths if not is_url(p)])
+                self.message(tr("msg.added_to", n=len(paths), name=name.strip()))
             self.reload_sidebar()
 
+    # ---------------------------------------------------------------- smart playlists
+    def _smart_rows(self, sid):
+        cur = cm_library.get_smart(sid)
+        return cm_library.query(smart=cur[2]) if cur else []
+
+    def edit_smart(self, sid=None):
+        import cm_smart
+        cur = cm_library.get_smart(sid) if sid else None
+        dlg = cm_smart.SmartDialog(self, cur[1] if cur else "", cur[2] if cur else None)
+        if not dlg.exec():
+            return
+        name, spec = dlg.result_value
+        try:
+            sid = cm_library.save_smart(sid, name, spec)
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, APP_NAME, tr("smart.name_taken", name=name))
+            return
+        self.view = ("smart", sid)
+        self.browse_value = None
+        self.show_page(0)
+        self.reload_sidebar()
+        self.reload_library()
+
+    def _delete_smart(self, sid):
+        if QMessageBox.question(self, APP_NAME, tr("smart.delete_q")) == QMessageBox.Yes:
+            cm_library.delete_smart(sid)
+            if self.view == ("smart", sid):
+                self.view = ("music", None)
+            self.reload_sidebar()
+            self.reload_library()
+
+    def _smart_to_playlist(self, sid):
+        cur = cm_library.get_smart(sid)
+        if not cur:
+            return
+        name, ok = QInputDialog.getText(self, tr("smart.to_playlist"), tr("pl.name"), text=cur[1] + " " + time.strftime("%Y-%m-%d"))
+        if ok and name.strip():
+            pid = cm_library.create_playlist(name.strip())
+            cm_library.add_to_playlist(pid, [r["path"] for r in cm_library.query(smart=cur[2])])
+            self.reload_sidebar()
+
+    # ---------------------------------------------------------------- browsing
     def set_browse(self, mode):
         self.browse = mode
+        settings["browse"] = mode
         self.browse_value = None
         self.acts["browse_" + mode].setChecked(True)
         self.show_page(0)
         self.reload_library()
 
-    def _album_clicked(self, idx):
-        album = idx.data(Qt.UserRole)
-        self.browse_value = None if self.browse_value == album else album
-        if self.browse_value is None:
-            self.albums.clearSelection()
+    def set_album_view(self, mode):
+        settings["album_view"] = mode
+        (self.b_grid if mode == "grid" else self.b_strip).setChecked(True)
+        self.acts["album_grid"].setChecked(mode == "grid")
+        if mode == "grid" and self._lib_mode() == "albums":
+            self.browse_value = None
+        self.show_page(0)
+        self.reload_library()
+
+    def _tile_size_changed(self, v):
+        settings["tile_size"] = v
+        self.tiles.configure(tile=v)
+        self._fix_strip_height()
+
+    def _album_sort_changed(self, _i):
+        settings["album_sort"] = self.sort_combo.currentData() or "artist"
+        self.reload_library()
+
+    def _lib_mode(self):
+        """What the library page shows: albums / videos (tiles), groups (artists, genres), folders, tracks."""
+        view, _ = self.view
+        if view in ("playlist", "smart", "missing", "most"):
+            return "tracks"
+        if self.browse == "folders":
+            return "folders"
+        if self.browse == "tracks":
+            return "tracks"
+        if view == "videos":
+            return "videos"
+        if self.browse in ("artists", "genres"):
+            return "groups"
+        return "albums"
+
+    def _fix_strip_height(self):
+        if self.tiles.mode == "strip":
+            self.tiles.apply()
+
+    def reload_library(self, keep=False):
+        mode = self._lib_mode()
+        grid = settings.get("album_view", "strip") == "grid"
+        if keep:
+            saved = (self.table.verticalScrollBar().value(), self.tiles.verticalScrollBar().value(),
+                     self.tiles.horizontalScrollBar().value())
+        tiles = mode in ("albums", "videos")
+        album_open = mode == "albums" and self.browse_value is not None
+        self.tiles.configure(mode="grid" if grid else "strip", wide=mode == "videos")
+        self.tiles.setVisible(tiles and not (grid and album_open))
+        self.lib_layout.setStretchFactor(self.tiles, 1 if grid else 0)
+        self.lower.setVisible(not (tiles and grid and not album_open))
+        self.lib_bar.setVisible(tiles)
+        self.group_list.setVisible(mode == "groups")
+        self.folder_tree.setVisible(mode == "folders")
+        if tiles:
+            if mode == "videos":
+                self._load_video_tiles()
+            else:
+                self._load_album_tiles()
+        elif mode == "groups":
+            self.group_list.clear()
+            all_it = QListWidgetItem(tr("browse.all"))
+            all_it.setData(Qt.UserRole, None)
+            self.group_list.addItem(all_it)
+            for name, n in cm_library.groups(self.browse, self.view[0] if self.view[0] in cm_library.WHERE else "music"):
+                it = QListWidgetItem(f"{name}  ({n})")
+                it.setData(Qt.UserRole, name)
+                self.group_list.addItem(it)
+                if name == self.browse_value:
+                    it.setSelected(True)
+        elif mode == "folders":
+            view = self.view[0] if self.view[0] in cm_library.WHERE else "all"
+            self.folder_tree.load(cm_library.folders(view), settings.get("library_folders", []), tr("lib.other_places"),
+                                  cm_icons.flat("open", cm_theme.colours()["muted"], 18))
+            if self.browse_value:
+                self._select_folder(self.browse_value)
+        self._update_bar(mode, grid, album_open)
         self._load_tracks()
+        if keep:
+            QTimer.singleShot(0, lambda: (self.table.verticalScrollBar().setValue(saved[0]),
+                                          self.tiles.verticalScrollBar().setValue(saved[1]),
+                                          self.tiles.horizontalScrollBar().setValue(saved[2])))
+
+    def _update_bar(self, mode, grid, album_open):
+        self.b_back.setVisible(mode == "albums" and grid and album_open)
+        self.b_back.setIcon(cm_icons.flat("prev", cm_theme.colours()["accent"], 16))
+        self.sort_label.setVisible(mode == "albums")
+        self.sort_combo.setVisible(mode == "albums")
+        self.size_icon.setPixmap(cm_icons.flat("grid", cm_theme.colours()["muted"], 16).pixmap(16, 16))
+        c = cm_theme.colours()
+        self.b_strip.setIcon(cm_icons.flat("list", c["accent"] if not grid else c["muted"], 18))
+        self.b_grid.setIcon(cm_icons.flat("grid", c["accent"] if grid else c["muted"], 18))
+        n = self.tile_model.rowCount()
+        if mode == "videos":
+            self.bar_title.setText(tr("lib.n_videos", n=n))
+        elif mode == "albums":
+            self.bar_title.setText(tr("lib.n_albums", n=n) if not (grid and album_open) else "")
+
+    def _back_to_grid(self):
+        self.browse_value = None
+        self.reload_library()
+        QTimer.singleShot(0, lambda: self.tiles.verticalScrollBar().setValue(getattr(self, "_grid_scroll", 0)))
+
+    def _placeholder(self, key, wide=False):
+        cache = self.__dict__.setdefault("_ph_cache", {})
+        k = ("v" if wide else "a", sum(map(ord, key or "x")) % 6)
+        if k not in cache:
+            cache[k] = QIcon(_video_placeholder(key) if wide else cm_icons.placeholder_cover(160, key))
+        return cache[k]
+
+    def _load_album_tiles(self):
+        view = self.view[0]
+        albums = cm_library.albums(view, settings.get("album_sort", "artist"), self.header.search.text().strip())
+        self.tile_model.clear()
+        self._tile_items = {}
+        self._tile_rows = {}
+        todo = []
+        sel_index = None
+        for a in albums:
+            who = a["artist"] if a["artist"] is not None else tr("lib.various")
+            it = QStandardItem(f'{a["album"]}\n{who}')
+            it.setData(a["key"], Qt.UserRole)
+            it.setToolTip(" · ".join(x for x in (a["album"], who, a["year"], tr("lib.n_tracks", n=a["count"])) if x))
+            tp = cm_library.thumb_path("album|" + a["key"])
+            if os.path.isfile(tp):
+                it.setIcon(QIcon(tp))
+            else:
+                it.setIcon(self._placeholder(a["album"]))
+                todo.append((a["key"], a["sample"], tp))
+            self._tile_items[a["key"]] = it
+            self._tile_rows[a["key"]] = a
+            self.tile_model.appendRow(it)
+            if a["key"] == self.browse_value:
+                sel_index = it.index()
+        if sel_index is not None:
+            from PySide6.QtCore import QItemSelectionModel
+            self.tiles.selectionModel().setCurrentIndex(sel_index, QItemSelectionModel.ClearAndSelect)
+            self.tiles.scrollTo(sel_index)
+        if todo:
+            cm_online.run(_make_thumbs, todo, progress=self._thumb_ready)
+
+    def _thumb_ready(self, _i, _n, key):
+        it = getattr(self, "_tile_items", {}).get(key)
+        tp = cm_library.thumb_path("album|" + key)
+        if it is not None and os.path.isfile(tp):
+            try:
+                it.setIcon(QIcon(tp))
+            except RuntimeError:
+                pass
+
+    def _load_video_tiles(self):
+        rows = cm_library.query(self.view[0], search=self.header.search.text().strip())
+        self.tile_model.clear()
+        self._tile_items = {}
+        self._tile_rows = {r["path"]: r for r in rows}
+        self._video_rows = rows
+        self.thumbnailer.clear()
+        for r in rows:
+            p = r["path"]
+            dur = r.get("duration") or 0
+            sub = fmt_time(dur) if dur else os.path.splitext(p)[1].lstrip(".").upper()
+            it = QStandardItem(f'{r.get("title") or os.path.basename(p)}\n{sub}')
+            it.setData(p, Qt.UserRole)
+            if r.get("resume_ms") and dur:
+                it.setData(min(1.0, r["resume_ms"] / 1000.0 / dur), Qt.UserRole + 2)
+                it.setToolTip(tr("lib.resume_tip", time=fmt_time(r["resume_ms"] / 1000)))
+            else:
+                it.setToolTip(p)
+            tp = cm_library.video_thumb_path(p, r.get("mtime"))
+            if os.path.isfile(tp):
+                it.setIcon(QIcon(tp))
+            else:
+                it.setIcon(self._placeholder(r.get("title") or p, wide=True))
+                if not r.get("missing") and os.path.isfile(p):
+                    self.thumbnailer.request(p, tp)
+            self._tile_items[p] = it
+            self.tile_model.appendRow(it)
+
+    def _video_thumb_ready(self, path, out):
+        it = getattr(self, "_tile_items", {}).get(path)
+        if it is not None:
+            try:
+                it.setIcon(QIcon(out))
+            except RuntimeError:
+                pass
+        if path == self.player.current() and not self.player.has_video():
+            pass
+
+    def _tile_clicked(self, idx):
+        if self._lib_mode() == "videos":
+            return
+        key = idx.data(Qt.UserRole)
+        if settings.get("album_view") == "grid":
+            if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+                return
+            self._grid_scroll = self.tiles.verticalScrollBar().value()
+            self.browse_value = key
+            self.reload_library()
+        else:
+            if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+                return
+            self.browse_value = None if self.browse_value == key else key
+            if self.browse_value is None:
+                self.tiles.clearSelection()
+            self.table.clear_sort()
+            self._load_tracks()
+
+    def _tile_activated(self, idx):
+        key = idx.data(Qt.UserRole)
+        if self._lib_mode() == "videos":
+            rows = getattr(self, "_video_rows", [])
+            start = next((i for i, r in enumerate(rows) if r["path"] == key), 0)
+            self._play_list(rows, start)
+        else:
+            self._play_list(cm_library.query(self.view[0], album_key=key))
+
+    def _tile_paths(self, keys):
+        if self._lib_mode() == "videos":
+            return [k for k in keys if k]
+        out = []
+        for k in keys:
+            out += [r["path"] for r in cm_library.query(self.view[0], album_key=k)]
+        return out
+
+    def _tile_selected_paths(self):
+        keys = [i.data(Qt.UserRole) for i in sorted(self.tiles.selectedIndexes(), key=lambda i: i.row())]
+        return self._tile_paths(keys)
+
+    def _tile_menu(self, pos):
+        idx = self.tiles.indexAt(pos)
+        if not idx.isValid():
+            return
+        if not self.tiles.selectionModel().isSelected(idx):
+            self.tiles.setCurrentIndex(idx)
+        paths = self._tile_selected_paths()
+        rows = self._rows_for(paths)
+        self._track_menu(rows, self.tiles.viewport().mapToGlobal(pos), source="tiles")
 
     def _group_clicked(self, it):
         self.browse_value = it.data(Qt.UserRole)
         self._load_tracks()
 
-    def reload_library(self):
-        view, _ = self.view
-        is_pl = view == "playlist"
-        show_albums = self.browse == "albums" and not is_pl and view in ("music", "favourites", "nocover", "nolyrics", "recent")
-        self.albums.setVisible(show_albums)
-        self.group_list.setVisible(self.browse in ("artists", "genres") and not is_pl and view != "videos")
-        if show_albums:
-            self._load_albums(view)
-        elif self.group_list.isVisible():
-            self.group_list.clear()
-            all_it = QListWidgetItem(tr("browse.all"))
-            all_it.setData(Qt.UserRole, None)
-            self.group_list.addItem(all_it)
-            for name, n in cm_library.groups(self.browse, view if view in cm_library.WHERE else "music"):
-                it = QListWidgetItem(f"{name}  ({n})")
-                it.setData(Qt.UserRole, name)
-                self.group_list.addItem(it)
+    def _group_menu(self, pos):
+        it = self.group_list.itemAt(pos)
+        if it is None or it.data(Qt.UserRole) is None:
+            return
+        name = it.data(Qt.UserRole)
+        key = "artist" if self.browse == "artists" else "genre"
+        rows = cm_library.query(self.view[0] if self.view[0] in cm_library.WHERE else "music", **{key: name})
+        self._track_menu(rows, self.group_list.viewport().mapToGlobal(pos), source="group")
+
+    def _folder_clicked(self, it):
+        self.browse_value = it.data(0, Qt.UserRole)
         self._load_tracks()
 
-    def _load_albums(self, view):
-        self.album_model.clear()
-        albums = cm_library.groups("albums", view)
-        ph_cache = {}
-        self._album_items = {}
-        for album, who, n, sample in albums:
-            it = QStandardItem(f"{album}\n{who}")
-            it.setData(album, Qt.UserRole)
-            it.setToolTip(f"{album}\n{who} · {n}")
-            tp = cm_library.thumb_path(album + "|" + who)
-            if os.path.isfile(tp):
-                it.setIcon(QIcon(QPixmap(tp)))
-            else:
-                key = sum(map(ord, album)) % 6
-                if key not in ph_cache:
-                    ph_cache[key] = QIcon(cm_icons.placeholder_cover(124, album))
-                it.setIcon(ph_cache[key])
-                self._album_items[album] = (it, sample, tp)
-            self.album_model.appendRow(it)
-        if self._album_items:
-            todo = [(a, s, tp) for a, (it, s, tp) in self._album_items.items()]
-            cm_online.run(_make_thumbs, todo, progress=self._thumb_ready)
+    def _select_folder(self, folder):
+        from PySide6.QtWidgets import QTreeWidgetItemIterator
+        itr = QTreeWidgetItemIterator(self.folder_tree)
+        while itr.value():
+            item = itr.value()
+            if item.data(0, Qt.UserRole) == folder:
+                self.folder_tree.setCurrentItem(item)
+                return
+            itr += 1
 
-    def _thumb_ready(self, _i, _n, album):
-        entry = getattr(self, "_album_items", {}).get(album)
-        if entry and os.path.isfile(entry[2]):
-            try:
-                entry[0].setIcon(QIcon(QPixmap(entry[2])))
-            except RuntimeError:
-                pass
+    def _folder_menu(self, pos):
+        it = self.folder_tree.itemAt(pos)
+        folder = it.data(0, Qt.UserRole) if it else None
+        if not folder:
+            return
+        view = self.view[0] if self.view[0] in cm_library.WHERE else "all"
+        rows = cm_library.query(view, folder=folder)
+        extra = [(tr("lib.rescan_folder"), lambda: self.rescan_folders([folder]))]
+        roots = [os.path.normpath(r) for r in settings.get("library_folders", [])]
+        if os.path.normpath(folder) in roots:
+            extra.append((tr("lib.unwatch_folder"), lambda: self._remove_root(folder)))
+        self._track_menu(rows, self.folder_tree.viewport().mapToGlobal(pos), source="folder", extra=extra)
+
+    def _remove_root(self, folder):
+        if QMessageBox.question(self, APP_NAME, tr("lib.unwatch_q", folder=folder)) != QMessageBox.Yes:
+            return
+        settings["library_folders"] = [f for f in settings.get("library_folders", [])
+                                       if os.path.normpath(f) != os.path.normpath(folder)]
+        settings.save()
+        cm_library.remove_folder(folder)
+        self.browse_value = None
+        self.setup_watch()
+        self._library_changed()
 
     def _load_tracks(self):
-        view, _ = self.view
-        kw = {"search": self.header.search.text().strip()}
+        view, val = self.view
+        mode = self._lib_mode()
+        search = self.header.search.text().strip()
+        kw = {"search": search}
+        title = ""
         if view == "playlist":
-            kw["playlist"] = self.view[1]
+            kw["playlist"] = val
+            title = next((n for i, n, _ in cm_library.playlists() if i == val), "")
+        elif view == "smart":
+            cur = cm_library.get_smart(val)
+            kw["smart"] = cur[2] if cur else {"rules": []}
+            title = cur[1] if cur else ""
         else:
             kw["view"] = view
+            title = tr("side." + view)
         if self.browse_value is not None:
-            if self.browse == "albums":
-                kw["album"] = self.browse_value
-            elif self.browse == "artists":
-                kw["artist"] = self.browse_value
-            elif self.browse == "genres":
-                kw["genre"] = self.browse_value
-        rows = cm_library.query(**kw)
+            if mode == "albums":
+                kw["album_key"] = self.browse_value
+            elif mode == "groups":
+                kw["artist" if self.browse == "artists" else "genre"] = self.browse_value
+                title = self.browse_value
+            elif mode == "folders":
+                kw["folder"] = self.browse_value
+                title = os.path.basename(self.browse_value.rstrip("\\/")) or self.browse_value
+        if mode == "videos" and settings.get("album_view") == "grid":
+            rows = []
+        else:
+            rows = cm_library.query(**kw)
+        if mode == "albums" and self.browse_value is not None and not rows and not search:
+            self.browse_value = None
+            self.reload_library()
+            return
         self.table.model_.set_rows(rows)
         self.table.model_.set_playing(self.player.current())
         has = bool(rows)
         self.table.setVisible(has)
         self.empty.setVisible(not has)
         if not has:
-            self.empty.setText(tr("lib.empty") if not settings.get("library_folders") else tr("lib.nothing"))
-        # header line above the table
-        if self.browse == "albums" and self.browse_value and rows:
+            if view == "missing":
+                self.empty.setText(tr("lib.no_missing"))
+            elif view == "smart":
+                self.empty.setText(tr("smart.empty"))
+            else:
+                self.empty.setText(tr("lib.empty") if not settings.get("library_folders") else tr("lib.nothing"))
+        total = sum(r.get("duration") or 0 for r in rows)
+        if mode == "albums" and self.browse_value is not None and rows:
+            a = getattr(self, "_tile_rows", {}).get(self.browse_value) or {}
             r0 = rows[0]
-            total = sum(r.get("duration") or 0 for r in rows)
-            self.head_title.setText(self.browse_value)
-            who = r0.get("albumartist") or r0.get("artist") or ""
-            bits = [who, r0.get("year") or "", r0.get("genre") or "", tr("lib.n_tracks", n=len(rows)), fmt_time(total)]
+            who = a.get("artist") if a else (r0.get("albumartist") or r0.get("artist"))
+            if who is None:
+                who = tr("lib.various")
+            self.head_title.setText(r0.get("album") or a.get("album") or "")
+            bits = [who or "", r0.get("year") or "", r0.get("genre") or "", tr("lib.n_tracks", n=len(rows)), fmt_time(total)]
             self.head_sub.setText(" · ".join(b for b in bits if b))
-            self.head_cover.set_cover(cm_tags.cover(r0["path"]), self.browse_value)
+            sample = next((r["path"] for r in rows if not r.get("missing")), r0["path"])
+            self.head_cover.set_cover(cm_tags.cover(sample) if os.path.isfile(sample) else None, r0.get("album") or "")
         else:
-            title = self.browse_value or (next((n for i, n, _ in cm_library.playlists() if i == self.view[1]), "")
-                                          if view == "playlist" else tr("side." + view))
             self.head_title.setText(title)
-            total = sum(r.get("duration") or 0 for r in rows)
             self.head_sub.setText(" · ".join(x for x in (tr("lib.n_tracks", n=len(rows)), fmt_time(total) if total else "") if x))
             self.head_cover.set_cover(None, title)
+        extra = {"missing": "lib.forget_missing", "smart": "smart.edit"}.get(view)
+        self.b_extra.setVisible(bool(extra) and has or view == "smart")
+        if extra:
+            self.b_extra.setText(tr(extra))
+        self.b_more.setVisible(has)
+        self.b_play_all.setEnabled(has)
+        self.b_shuffle_all.setEnabled(has)
         self.album_head.setVisible(True)
 
-    def play_rows(self, start, shuffle=False):
-        rows = self.table.model_.rows
+    def _head_extra(self):
+        if self.view[0] == "missing":
+            self.forget_missing()
+        elif self.view[0] == "smart":
+            self.edit_smart(self.view[1])
+
+    # ---------------------------------------------------------------- playing from the library
+    def _play_list(self, rows, start=0, shuffle=False):
+        rows = list(rows)
         if not rows:
             return
-        paths = [r["path"] for r in rows]
+        start = max(0, min(start, len(rows) - 1))
+        if rows[start].get("missing") and not shuffle:
+            self._missing_prompt(rows[start])
+            return
+        playable = [r for r in rows if not r.get("missing")]
+        if not playable:
+            self._missing_prompt(rows[start])
+            return
+        paths = [r["path"] for r in playable]
+        idx = paths.index(rows[start]["path"]) if rows[start]["path"] in paths else 0
         if shuffle:
             self.player.set_shuffle(True)
-            import random
-            start = random.randrange(len(paths))
-        self.player.set_queue(paths, start, True)
-        if is_video(paths[start]):
+            idx = random.randrange(len(paths))
+        self.player.set_queue(paths, idx, True)
+        if is_video(paths[idx]):
             self.center.setCurrentIndex(1)
+
+    def play_rows(self, start, shuffle=False):
+        self._play_list(self.table.model_.rows, start, shuffle)
+
+    def _table_activated(self, idx):
+        if self.table.state() == QAbstractItemView.EditingState:
+            return
+        self.play_rows(idx.row())
+
+    def _rows_for(self, paths):
+        got = cm_library.get_many(paths)
+        return [got[p] for p in paths if p in got]
 
     def _table_menu(self, pos):
         rows = self.table.selected_rows()
+        if rows:
+            self._track_menu(rows, self.table.viewport().mapToGlobal(pos), source="table")
+
+    def _track_menu(self, rows, gpos, source="table", extra=None):
+        """The one right-click menu for tracks, albums, artists, genres, folders and videos."""
         if not rows:
             return
         paths = [r["path"] for r in rows]
+        playable = [r["path"] for r in rows if not r.get("missing")]
+        audio = [r["path"] for r in rows if r.get("kind") != "video" and not r.get("missing")]
         m = QMenu(self)
-        m.addAction(cm_icons.glossy("play", "green", 20), tr("act.play"), lambda: self.player.set_queue(paths))
-        m.addAction(tr("menu.play_next"), lambda: self.player.insert_next(paths))
-        m.addAction(tr("menu.add_queue"), lambda: self.player.add(paths))
-        sub = m.addMenu(tr("act.add_to_playlist"))
+        m.addAction(cm_icons.glossy("play", "green", 20), tr("act.play"), lambda: self._play_list(rows))
+        if len(rows) > 1:
+            m.addAction(cm_icons.glossy("shuffle", "purple", 20), tr("btn.shuffle_all"),
+                        lambda: self._play_list(rows, shuffle=True))
+        m.addAction(tr("menu.play_next"), lambda: self.player.insert_next(playable))
+        m.addAction(tr("menu.add_queue"), lambda: self.player.add(playable))
+        sub = m.addMenu(cm_icons.glossy("playlist", "teal", 20), tr("act.add_to_playlist"))
         self._fill_playlist_menu(sub, paths)
-        if self.view[0] == "playlist":
+        if source == "table" and self.view[0] == "playlist":
             pid = self.view[1]
             m.addAction(tr("menu.remove_from_pl"), lambda: (cm_library.remove_from_playlist(pid, paths),
-                                                           self.reload_library(), self.reload_sidebar()))
+                                                           self.reload_library(keep=True), self.reload_sidebar()))
         m.addSeparator()
-        m.addAction(cm_icons.glossy("tag", "orange", 20), tr("act.edit_tags"), lambda: self.edit_tags(paths=paths))
-        m.addAction(cm_icons.glossy("image", "pink", 20), tr("act.find_cover"), lambda: self.find_cover(paths=paths))
-        m.addAction(cm_icons.glossy("lyrics", "pink", 20), tr("act.find_lyrics"), lambda: self.find_lyrics(path=paths[0]))
+        if len(rows) == 1 and rows[0].get("missing"):
+            m.addAction(cm_icons.glossy("search", "orange", 20), tr("lib.locate"), lambda: self.locate_missing(rows[0]))
+        if playable:
+            m.addAction(cm_icons.glossy("tag", "orange", 20), tr("act.edit_tags") + "\tCtrl+T",
+                        lambda: self.edit_tags(paths=playable))
+        if audio:
+            m.addAction(cm_icons.glossy("image", "pink", 20), tr("act.find_cover"), lambda: self.find_cover(paths=audio))
+            if len(audio) == 1:
+                m.addAction(cm_icons.glossy("lyrics", "pink", 20), tr("act.find_lyrics"),
+                            lambda: self.find_lyrics(path=audio[0]))
+            else:
+                m.addAction(cm_icons.glossy("cloud", "purple", 20), tr("menu.lyrics_for_these"),
+                            lambda: self.batch_lyrics(paths=audio))
         rate = m.addMenu(tr("menu.rating"))
         for n in range(6):
-            rate.addAction("★" * n + "☆" * (5 - n) if n else tr("menu.no_rating"),
-                           lambda n=n: self._set_rating(paths, n))
+            rate.addAction("★" * n + "☆" * (5 - n) if n else tr("menu.no_rating"), lambda n=n: self._set_rating(paths, n))
         fav = all(r.get("favourite") for r in rows)
-        m.addAction(tr("menu.unfavourite") if fav else tr("menu.favourite"), lambda: self._set_fav(paths, not fav))
+        m.addAction(cm_icons.flat("heartf" if not fav else "heart", "#e5484d", 18),
+                    tr("menu.unfavourite") if fav else tr("menu.favourite"), lambda: self._set_fav(paths, not fav))
         m.addSeparator()
-        m.addAction(tr("menu.show_folder"), lambda: self.show_in_folder(paths[0]))
-        m.exec(self.table.viewport().mapToGlobal(pos))
+        if extra:
+            for text, fn in extra:
+                m.addAction(text, fn)
+        m.addAction(cm_icons.glossy("open", "blue", 20), tr("menu.show_folder"), lambda: self.show_in_folder(paths[0]))
+        m.addSeparator()
+        n = len(rows)
+        m.addAction(cm_icons.glossy("remove", "gray", 20), tr("menu.remove_lib", n=n) + "\tDel",
+                    lambda: self.remove_from_library(paths))
+        m.addAction(cm_icons.glossy("trash", "red", 20), tr("menu.delete_files", n=n) + "\tShift+Del",
+                    lambda: self.delete_files(paths))
+        m.exec(gpos)
+
+    def _update_rows_in_place(self, paths, **fields):
+        """Change rows of the table without reloading (keeps the scroll position and selection)."""
+        model = self.table.model_
+        want = set(paths)
+        for i, r in enumerate(model.rows):
+            if r["path"] in want:
+                r.update(fields)
+                model.row_changed(i)
 
     def _set_rating(self, paths, n):
         for p in paths:
             cm_library.update_fields(p, rating=n)
-        self._load_tracks()
+        self._update_rows_in_place(paths, rating=n)
+
+    def _rate_row(self, row, n):
+        self._set_rating([row["path"]], n)
 
     def _set_fav(self, paths, on):
         for p in paths:
             cm_library.update_fields(p, favourite=int(on))
-        self._load_tracks()
+        if self.view == ("favourites", None):
+            self.reload_library(keep=True)
+        else:
+            self._update_rows_in_place(paths, favourite=int(on))
         self.reload_sidebar()
         if self.player.current() in paths:
             self.acts["favourite"].setChecked(on)
@@ -1419,12 +1991,286 @@ class MainWindow(QMainWindow):
         r = cm_library.get(cur) or {}
         self._set_fav([cur], not r.get("favourite"))
 
+    def _edit_cell(self, row, field, value):
+        """F2 in the track table: write one tag straight into the file."""
+        path = row["path"]
+        if not os.path.isfile(path) or not cm_tags.can_write(path):
+            QMessageBox.information(self, APP_NAME, tr("tag.cannot_write"))
+            return None
+        if field == "year" and value and not re.fullmatch(r"\d{4}", value):
+            self.message(tr("tag.bad_year"))
+            return None
+        if field == "track" and value and not re.fullmatch(r"\d{1,3}(/\d{1,3})?", value):
+            self.message(tr("tag.bad_track"))
+            return None
+        try:
+            self.release_file(path, lambda: cm_tags.write(path, {field: value}))
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, tr("msg.save_failed") + f"\n\n{os.path.basename(path)}: {e}")
+            return None
+        old_key = row.get("album_key") or ""
+        cm_library.refresh_file(path)
+        new = cm_library.get(path)
+        if new and (new.get("album_key") != old_key or path == self.player.current()):
+            QTimer.singleShot(0, lambda: self._after_tag_change([path], old_keys=[old_key]))
+        return new
+
+    # ---------------------------------------------------------------- removing and deleting
+    def remove_from_library(self, paths, confirm=True):
+        """Hide from the library; the files stay. Missing files are dropped completely."""
+        paths = [p for p in dict.fromkeys(paths) if p and not is_url(p)]
+        if not paths:
+            self.message(tr("msg.select_first"))
+            return False
+        if confirm and QMessageBox.question(self, APP_NAME, tr("lib.remove_q", n=len(paths))) != QMessageBox.Yes:
+            return False
+        rows = cm_library.get_many(paths)
+        gone = [p for p in paths if rows.get(p, {}).get("missing")]
+        keep = [p for p in paths if p not in gone]
+        if gone:
+            cm_library.forget(gone)
+        if keep:
+            cm_library.hide(keep)
+        self.message(tr("msg.removed", n=len(paths)), 7000)
+        self._library_changed()
+        return True
+
+    def delete_files(self, paths, confirm=True):
+        """Move files to the Recycle Bin (asks first)."""
+        paths = [p for p in dict.fromkeys(paths) if p and not is_url(p)]
+        if not paths:
+            self.message(tr("msg.select_first"))
+            return False
+        if confirm:
+            box = QMessageBox(QMessageBox.Warning, APP_NAME, tr("lib.delete_q", n=len(paths)),
+                              QMessageBox.Yes | QMessageBox.No, self)
+            box.setDefaultButton(QMessageBox.No)
+            if len(paths) <= 8:
+                box.setInformativeText("\n".join(os.path.basename(p) for p in paths))
+            if box.exec() != QMessageBox.Yes:
+                return False
+        want = set(paths)
+        if self.player.current() in want:
+            self.player.release()
+            QApplication.processEvents()
+            time.sleep(0.2)
+        rows = [i for i, p in enumerate(self.player.queue) if p in want]
+        if rows:
+            self.player.remove_rows(rows)
+        done, failed = cm_library.trash(paths)
+        if failed:
+            QMessageBox.warning(self, APP_NAME, tr("lib.delete_failed") + "\n\n" +
+                                "\n".join(os.path.basename(p) for p, _r in failed[:15]))
+        if done:
+            self.message(tr("msg.deleted", n=len(done)), 7000)
+        self._library_changed()
+        return bool(done)
+
+    def _library_changed(self):
+        self.reload_sidebar()
+        self.reload_library(keep=True)
+        self._update_stats()
+
+    # ---------------------------------------------------------------- missing files
+    def _missing_prompt(self, row):
+        box = QMessageBox(QMessageBox.Warning, APP_NAME, tr("lib.missing_q", name=os.path.basename(row["path"])),
+                          QMessageBox.Cancel, self)
+        box.setInformativeText(row["path"])
+        loc = box.addButton(tr("lib.locate"), QMessageBox.AcceptRole)
+        rem = box.addButton(tr("act.remove_lib"), QMessageBox.DestructiveRole)
+        box.exec()
+        if box.clickedButton() is loc:
+            self.locate_missing(row)
+        elif box.clickedButton() is rem:
+            cm_library.forget([row["path"]])
+            self._library_changed()
+
+    def locate_missing(self, row):
+        old = row["path"]
+        start = os.path.dirname(old)
+        while start and not os.path.isdir(start) and os.path.dirname(start) != start:
+            start = os.path.dirname(start)
+        ext = os.path.splitext(old)[1]
+        fn, _ = QFileDialog.getOpenFileName(self, tr("lib.locate_title", name=os.path.basename(old)), start,
+                                            f"{tr('dlg.media_files')} (*{ext});;{tr('dlg.all_files')} (*.*)")
+        if not fn:
+            return
+        others = cm_library.relocate(old, os.path.normpath(fn))
+        self.message(tr("msg.located", n=others) if others else tr("msg.located_one"), 7000)
+        if others:
+            QMessageBox.information(self, APP_NAME, tr("msg.located", n=others))
+        self._library_changed()
+
+    def forget_missing(self):
+        rows = cm_library.query("missing")
+        if not rows:
+            self.message(tr("lib.no_missing"))
+            return
+        if QMessageBox.question(self, APP_NAME, tr("lib.forget_missing_q", n=len(rows))) != QMessageBox.Yes:
+            return
+        cm_library.forget([r["path"] for r in rows])
+        if self.view == ("missing", None):
+            self.view = ("music", None)
+        self._library_changed()
+
+    def show_missing(self):
+        if not cm_library.counts().get("missing"):
+            QMessageBox.information(self, APP_NAME, tr("lib.no_missing"))
+            return
+        self.view = ("missing", None)
+        self.browse_value = None
+        self.show_page(0)
+        self.reload_sidebar()
+        self.reload_library()
+
+    # ---------------------------------------------------------------- tools
+    def show_hidden(self):
+        dlg = cm_dialogs.HiddenDialog(self)
+        dlg.exec()
+        if dlg.changed:
+            self._library_changed()
+
+    def show_duplicates(self):
+        import cm_duplicates
+        dlg = cm_duplicates.DuplicatesDialog(self)
+        dlg.exec()
+        if dlg.changed:
+            self._library_changed()
+
+    def show_statistics(self):
+        cm_dialogs.StatsDialog(self).exec()
+
+    def backup_library(self):
+        name = f"{APP_NAME} backup {time.strftime('%Y-%m-%d')}{cm_library.BACKUP_EXT}"
+        fn, _ = QFileDialog.getSaveFileName(self, tr("act.backup"), os.path.join(os.path.expanduser("~"), name),
+                                            f"{tr('dlg.backup_files')} (*{cm_library.BACKUP_EXT})")
+        if not fn:
+            return
+        if not fn.lower().endswith(cm_library.BACKUP_EXT):
+            fn += cm_library.BACKUP_EXT
+        self._save_state()
+        try:
+            cm_library.backup(fn, settings.path)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, tr("msg.backup_failed") + f"\n\n{e}")
+            return
+        self.message(tr("msg.backup_saved", name=os.path.basename(fn)), 7000)
+
+    def restore_library(self):
+        fn, _ = QFileDialog.getOpenFileName(self, tr("act.restore"), os.path.expanduser("~"),
+                                            f"{tr('dlg.backup_files')} (*{cm_library.BACKUP_EXT})")
+        if not fn:
+            return
+        try:
+            info = cm_library.read_backup_info(fn)
+        except cm_library.BackupError:
+            QMessageBox.warning(self, APP_NAME, tr("msg.not_backup"))
+            return
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.get("created") or 0))
+        if QMessageBox.question(self, APP_NAME, tr("lib.restore_q", date=when)) != QMessageBox.Yes:
+            return
+        if self.batch_task is not None:
+            self.batch_task.cancelled = True
+        try:
+            data = cm_library.restore(fn)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, tr("msg.not_backup") + f"\n\n{e}")
+            return
+        keep = ("geometry", "queue", "queue_index")
+        for k, v in data.items():
+            if k in settings and k not in keep:
+                settings[k] = v
+        settings.save()
+        self.view = ("music", None)
+        self.browse_value = None
+        self.browse = settings.get("browse", "albums")
+        self.acts["browse_" + self.browse].setChecked(True)
+        set_language(settings.get("language") or "en")
+        self.set_lang(settings.get("language") or "en")
+        self.apply_theme()
+        self._library_changed()
+        self.setup_watch()
+        QMessageBox.information(self, APP_NAME, tr("msg.restored"))
+        self.rescan(quiet=True)
+
+    # ---------------------------------------------------------------- watching the library folders
+    def setup_watch(self):
+        dirs = self.watcher.directories()
+        if dirs:
+            self.watcher.removePaths(dirs)
+        self.periodic_timer.stop()
+        self.acts["watch_folders"].setChecked(bool(settings.get("watch_folders", True)))
+        if not settings.get("watch_folders", True):
+            return
+        roots = [f for f in settings.get("library_folders", []) if os.path.isdir(f)]
+        if not roots:
+            return
+        self.periodic_timer.start()
+        cm_online.run(_watch_dirs, roots, done=self._add_watch_dirs)
+
+    def _add_watch_dirs(self, dirs):
+        if not settings.get("watch_folders", True):
+            return
+        have = set(self.watcher.directories())
+        new = [d for d in dirs if d not in have]
+        if new:
+            self.watcher.addPaths(new)
+
+    def toggle_watch(self, on):
+        settings["watch_folders"] = bool(on)
+        self.setup_watch()
+        self.message(tr("msg.watch_on") if on else tr("msg.watch_off"))
+
+    def _dir_changed(self, d):
+        self._pending_dirs.add(d)
+        self.watch_timer.start()
+
+    def _watch_scan(self):
+        if self.watch_task is not None or self.batch_task is not None:
+            self.watch_timer.start()
+            return
+        dirs = sorted(self._pending_dirs, key=len)
+        self._pending_dirs = set()
+        top = []
+        for d in dirs:
+            if not any(d == t or d.startswith(t.rstrip("\\/") + os.sep) for t in top):
+                top.append(d)
+        if top:
+            self.watch_task = cm_online.run(cm_library.scan, top, done=self._watch_done,
+                                            failed=lambda _m: setattr(self, "watch_task", None))
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        from PySide6.QtCore import QEvent
+        if e.type() == QEvent.ActivationChange and self.isActiveWindow() and settings.get("watch_folders", True) \
+                and time.monotonic() - self._last_quiet_scan > 120:
+            QTimer.singleShot(500, self._periodic_scan)
+
+    def _periodic_scan(self):
+        if self.watch_task is not None or self.batch_task is not None:
+            return
+        self._last_quiet_scan = time.monotonic()
+        folders = [f for f in settings.get("library_folders", []) if os.path.isdir(f)]
+        if folders:
+            self.watch_task = cm_online.run(cm_library.scan, folders, done=self._watch_done,
+                                            failed=lambda _m: setattr(self, "watch_task", None))
+
+    def _watch_done(self, res):
+        self.watch_task = None
+        if res.get("added") or res.get("missing") or res.get("back"):
+            self._library_changed()
+            self.message(tr("msg.watch_found", added=res.get("added", 0), missing=res.get("missing", 0)), 6000)
+            roots = [f for f in settings.get("library_folders", []) if os.path.isdir(f)]
+            if roots and settings.get("watch_folders", True):
+                cm_online.run(_watch_dirs, roots, done=self._add_watch_dirs)
+
     def show_in_folder(self, path):
         if sys.platform == "win32":
             import subprocess
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            target = path if os.path.exists(path) else os.path.dirname(path)
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(target)])
         else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path if os.path.isdir(path) else os.path.dirname(path)))
 
     def add_library_folder(self):
         d = QFileDialog.getExistingDirectory(self, tr("act.add_folder"))
@@ -1435,6 +2281,7 @@ class MainWindow(QMainWindow):
                 settings["library_folders"] = folders + [d]
                 settings.save()
             self.rescan()
+            self.setup_watch()
 
     def rescan(self, quiet=False):
         folders = [f for f in settings.get("library_folders", []) if os.path.isdir(f)]
@@ -1442,6 +2289,9 @@ class MainWindow(QMainWindow):
             if not quiet:
                 self.add_library_folder()
             return
+        self.rescan_folders(folders)
+
+    def rescan_folders(self, folders):
         if self.batch_task is not None:
             return
         self._start_progress(tr("msg.scanning"))
@@ -1450,10 +2300,8 @@ class MainWindow(QMainWindow):
 
     def _scan_done(self, res):
         self._end_progress()
-        self.message(tr("msg.scan_done", added=res.get("added", 0), removed=res.get("removed", 0)), 6000)
-        self.reload_sidebar()
-        self.reload_library()
-        self._update_stats()
+        self.message(tr("msg.scan_done", added=res.get("added", 0), missing=res.get("missing", 0)), 6000)
+        self._library_changed()
 
     def _start_progress(self, text):
         self.st_msg.setText(text)
@@ -1486,15 +2334,63 @@ class MainWindow(QMainWindow):
         self.st_stats.setText(tr("st.library", tracks=s["a"], videos=s["v"], albums=s["al"],
                                  size=f'{s["s"] / 1073741824:.1f} GB'))
 
+    # ---------------------------------------------------------------- resume and listening time
+    def _resume_lookup(self, path):
+        if not settings.get("resume", True):
+            return 0
+        r = cm_library.get(path)
+        return int(r.get("resume_ms") or 0) if r else 0
+
+    def _resumed(self, ms):
+        self.video.show_osd(tr("osd.resumed", time=fmt_time(ms / 1000)))
+        self.message(tr("msg.resumed", time=fmt_time(ms / 1000)), 6000)
+
+    def _leaving(self, path, pos, dur):
+        secs = self._listen_acc / 1000.0
+        self._listen_acc = 0
+        self._listen_last = None
+        if is_url(path):
+            return
+        if secs >= 5:
+            cm_library.record_listen(path, secs)
+        if not settings.get("resume", True):
+            return
+        if not (is_video(path) or dur >= RESUME_MIN_MS):
+            return
+        near_end = dur > 0 and pos >= dur - max(60000, dur * 0.05)
+        if pos < 30000 and not near_end and secs < 5:
+            return      # opened but hardly played (e.g. the queue restored at start-up): keep the old position
+        new = 0 if (pos < 30000 or near_end) else pos
+        cm_library.set_resume(path, new)
+        it = getattr(self, "_tile_items", {}).get(path)
+        if it is not None and dur > 0:
+            try:
+                it.setData(new / dur if new else 0, Qt.UserRole + 2)
+            except RuntimeError:
+                pass
+
+    def _start_over(self):
+        cur = self.player.current()
+        if cur:
+            self.player.seek(0)
+            if not is_url(cur):
+                cm_library.set_resume(cur, 0)
+
     # ================================================================ tags, covers, lyrics
-    def target_paths(self, all_rows=False):
-        """Selected library rows when the library is shown, otherwise the playing track."""
+    def target_paths(self, all_rows=False, library_only=False):
+        """Selected albums / videos / library rows when the library is shown, otherwise the playing track."""
         if all_rows:
             return [r["path"] for r in self.table.model_.rows]
-        if self.center.currentIndex() == 0 and self.table.isVisible():
-            sel = self.table.selected_paths()
-            if sel:
-                return sel
+        if self.center.currentIndex() == 0:
+            if self.tiles.isVisible() and self.tiles.selectedIndexes() and (
+                    self.tiles.hasFocus() or not (self.table.isVisible() and self.table.selected_paths())):
+                return self._tile_selected_paths()
+            if self.table.isVisible():
+                sel = self.table.selected_paths()
+                if sel:
+                    return sel
+        if library_only:
+            return []
         if self.queue.hasFocus() and self.queue.selectedItems():
             return [self.player.queue[self.queue.row(it)] for it in self.queue.selectedItems()]
         cur = self.player.current()
@@ -1529,16 +2425,23 @@ class MainWindow(QMainWindow):
         cm_library.rename_path(old, new)
         self.player.queue = [new if p == old else p for p in self.player.queue]
 
-    def _after_tag_change(self, paths):
+    def _after_tag_change(self, paths, old_keys=()):
+        for k in old_keys:
+            if k:
+                cm_library.forget_thumb("album|" + k)
         for p in paths:
+            before = cm_library.get(p) or {}
+            if before.get("album_key"):
+                cm_library.forget_thumb("album|" + before["album_key"])
             try:
                 cm_library.refresh_file(p)
             except Exception:
                 pass
             r = cm_library.get(p) or {}
-            cm_library.forget_thumb((r.get("album") or "") + "|" + (r.get("albumartist") or r.get("artist") or ""))
+            if r.get("album_key"):
+                cm_library.forget_thumb("album|" + r["album_key"])
         cur = self.player.current()
-        self.reload_library()
+        self.reload_library(keep=True)
         self.reload_sidebar()
         self._fill_queue()
         if cur in paths:
@@ -1687,11 +2590,11 @@ class MainWindow(QMainWindow):
                 self._set_lyrics_text(text, "lrc" if settings.get("save_lrc_file", True) else "tag")
             self._load_tracks()
 
-    def batch_covers(self):
+    def batch_covers(self, paths=None):
         if not cm_dialogs.ask_online(self) or self.batch_task is not None:
             return
-        paths = self.target_paths() if self.center.currentIndex() == 0 and self.table.selected_paths() else \
-            [r["path"] for r in cm_library.query("nocover")]
+        if not paths:
+            paths = self.target_paths(library_only=True) or [r["path"] for r in cm_library.query("nocover")]
         paths = [p for p in paths if not is_video(p)]
         if not paths:
             self.message(tr("msg.nothing_to_do"))
@@ -1703,11 +2606,11 @@ class MainWindow(QMainWindow):
         self.batch_task = cm_online.run(_batch_covers, paths, busy, done=self._batch_done, failed=self._batch_failed,
                                         progress=self._batch_progress)
 
-    def batch_lyrics(self):
+    def batch_lyrics(self, paths=None):
         if not cm_dialogs.ask_online(self) or self.batch_task is not None:
             return
-        paths = self.target_paths() if self.center.currentIndex() == 0 and self.table.selected_paths() else \
-            [r["path"] for r in cm_library.query("nolyrics")]
+        if not paths:
+            paths = self.target_paths(library_only=True) or [r["path"] for r in cm_library.query("nolyrics")]
         paths = [p for p in paths if not is_video(p)]
         if not paths:
             self.message(tr("msg.nothing_to_do"))
@@ -1753,8 +2656,8 @@ class MainWindow(QMainWindow):
                 cm_library.remove_folder(f)
             if dlg.folders_changed:
                 self.rescan(quiet=True)
-            self.reload_library()
-            self._update_stats()
+            self.setup_watch()
+            self._library_changed()
 
     def show_shortcuts(self):
         d = cm_dialogs.Dialog(self, tr("set.shortcuts"), "keyboard", "teal")
@@ -1820,8 +2723,10 @@ class MainWindow(QMainWindow):
             self.toggle_fullscreen()
         if self.batch_task is not None:
             self.batch_task.cancelled = True
-        self._save_state()
+        self.thumbnailer.clear()
+        self.periodic_timer.stop()
         self.player.stop()
+        self._save_state()
         super().closeEvent(e)
 
 
@@ -1854,11 +2759,12 @@ def _batch_covers(paths, busy, progress=None, task=None):
     albums = {}
     for p in paths:
         i = cm_tags.read(p)
-        key = (i.get("albumartist") or i.get("artist") or "", i.get("album") or "")
+        key = (i.get("albumartist") or i.get("artist") or "", i.get("album") or "",
+               cm_library.album_key(i.get("album"), i.get("albumartist"), os.path.dirname(p)) or p)
         albums.setdefault(key, []).append((p, i))
     done = missing = 0
     failed = []
-    for n, ((artist, album), items) in enumerate(albums.items()):
+    for n, ((artist, album, akey), items) in enumerate(albums.items()):
         if task is not None and task.cancelled:
             break
         if progress:
@@ -1885,7 +2791,7 @@ def _batch_covers(paths, busy, progress=None, task=None):
                 done += 1
             except Exception as e:
                 failed.append(f"{os.path.basename(p)}: {e}")
-        cm_library.forget_thumb(album + "|" + artist)
+        cm_library.forget_thumb("album|" + akey)
     return done, missing, failed
 
 
@@ -1917,3 +2823,33 @@ def _batch_lyrics(paths, busy, embed, lrc_file, progress=None, task=None):
             cm_library.update_fields(p, has_lyrics=1)
             done += 1
     return done, missing, failed
+
+
+def _watch_dirs(roots):
+    """Only the library folders themselves are watched: on Windows a watched folder can't be renamed or deleted in
+    Explorer, so album folders are left free. Changes deeper down are found by the quiet background check
+    (every 10 minutes and when the window becomes active again)."""
+    return [os.path.normpath(r) for r in roots if os.path.isdir(r)]
+
+
+def _video_placeholder(seed):
+    """16:9 tile for a video whose thumbnail is not made yet."""
+    w, h = 320, 180
+    pm = QPixmap(w, h)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    g = QLinearGradient(0, 0, w, h)
+    tones = [("#1e293b", "#334155"), ("#1e1b4b", "#3730a3"), ("#0f172a", "#155e75"), ("#3b0764", "#6b21a8"),
+             ("#14532d", "#166534"), ("#431407", "#9a3412")]
+    a, b = tones[sum(map(ord, seed or "x")) % len(tones)]
+    g.setColorAt(0, QColor(a))
+    g.setColorAt(1, QColor(b))
+    p.setBrush(g)
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(QRectF(0, 0, w, h), 10, 10)
+    icon = cm_icons.render_svg(cm_icons.flat_svg("video", "#ffffff"), 56, 1.0)
+    p.setOpacity(0.55)
+    p.drawPixmap(int((w - 56) / 2), int((h - 56) / 2), icon)
+    p.end()
+    return pm

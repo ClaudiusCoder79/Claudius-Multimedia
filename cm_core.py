@@ -4,7 +4,7 @@ import os
 import sys
 
 APP_NAME = "Claudius Multimedia"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHORS = "Michal Czapla & Claude AI"
 APP_URL = "https://github.com/ClaudiusCoder79/Claudius-Multimedia"
 USER_AGENT = f"ClaudiusMultimedia/{APP_VERSION} ( {APP_URL} )"
@@ -78,6 +78,14 @@ DEFAULTS = {
     "geometry": "",
     "always_on_top": False,
     "snapshot_dir": "",
+    # 1.1 - library
+    "watch_folders": True,        # notice new / changed files in the library folders by itself
+    "resume": True,               # continue videos and long recordings where they were stopped
+    "album_view": "strip",        # strip (one row above the tracks) / grid (full page of covers)
+    "tile_size": 124,
+    "album_sort": "artist",       # artist / title / year / added / plays
+    "browse": "albums",           # artists / albums / genres / folders / tracks
+    "table_header": "",           # track table columns: order, widths, hidden
 }
 
 

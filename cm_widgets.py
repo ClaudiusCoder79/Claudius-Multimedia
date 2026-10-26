@@ -1,15 +1,21 @@
 """Claudius Multimedia - building blocks of the main window: header + ribbon, transport bar, video view,
-synced lyrics view, track table and album strip."""
+synced lyrics view, track table (column chooser, star ratings, F2 editing, dragging), album / video tiles,
+sidebar and queue drop targets, folder tree."""
+import json
 import os
+import time
 import weakref
 
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QPointF, QRectF, QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import (QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QPointF, QRectF, QSize, Qt,
+                            QTimer, Signal)
+from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap,
+                           QStandardItemModel)
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QGraphicsPixmapItem, QGraphicsScene,
-                               QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QListView,
-                               QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy, QSlider, QStackedWidget,
-                               QStyle, QTableView, QToolButton, QVBoxLayout, QWidget, QGraphicsItem)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QFrame, QGraphicsPixmapItem,
+                               QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QLineEdit,
+                               QListView, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy, QSlider,
+                               QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget, QGraphicsItem)
 
 import cm_icons
 import cm_theme
@@ -118,6 +124,17 @@ class Header(QWidget):
             self.buttons[key].setChecked(True)
 
 
+def wrap_label(text, limit=13):
+    """Long ribbon labels go onto two lines (split at the space nearest the middle)."""
+    text = text.replace("&", "")
+    if len(text) <= limit or " " not in text:
+        return text
+    mid = len(text) // 2
+    spaces = [i for i, ch in enumerate(text) if ch == " "]
+    i = min(spaces, key=lambda k: abs(k - mid))
+    return text[:i] + "\n" + text[i + 1:]
+
+
 class RibbonButton(QToolButton):
     def __init__(self, action, menu=None):
         super().__init__()
@@ -125,12 +142,23 @@ class RibbonButton(QToolButton):
         self.setDefaultAction(action)
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         self.setIconSize(QSize(40, 40))
-        self.setFixedHeight(70)
+        self.setFixedHeight(80)
+        self._wrap()
         self.setAutoRaise(True)
         self.setCursor(Qt.PointingHandCursor)
         if menu is not None:
             self.setMenu(menu)
             self.setPopupMode(QToolButton.InstantPopup)
+
+    def _wrap(self):
+        a = self.defaultAction()
+        if a is not None:
+            self.setText(wrap_label(a.text()))
+            self.setToolTip(a.text().replace("&", ""))
+
+    def actionEvent(self, e):
+        super().actionEvent(e)
+        self._wrap()
 
 
 class Ribbon(QStackedWidget):
@@ -138,7 +166,7 @@ class Ribbon(QStackedWidget):
         super().__init__(parent)
         self.setObjectName("Ribbon")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setFixedHeight(100)
+        self.setFixedHeight(110)
         self.pages = {}
 
     def add_page(self, key, groups, actions, menus):
@@ -673,101 +701,276 @@ class LyricsView(QListWidget):
 
 
 # ------------------------------------------------------------------ track table
+TRACK_MIME = "application/x-claudius-tracks"
+
+
+def tracks_mime(paths):
+    md = QMimeData()
+    md.setData(TRACK_MIME, QByteArray(json.dumps(list(paths)).encode("utf-8")))
+    return md
+
+
+def paths_from_mime(md):
+    if md is None or not md.hasFormat(TRACK_MIME):
+        return []
+    try:
+        return [p for p in json.loads(bytes(md.data(TRACK_MIME)).decode("utf-8")) if isinstance(p, str)]
+    except ValueError:
+        return []
+
+
+LOSSLESS = {"FLAC", "ALAC", "WAV", "APE", "WV", "AIFF", "AIF", "WAVPACK", "MONKEY'S AUDIO"}
+
+# column id, header text key, default width, shown by default
+COLUMNS = [
+    ("no", "col.no", 38, True), ("title", "col.title", 230, True), ("artist", "col.artist", 170, True),
+    ("album", "col.album", 180, True), ("albumartist", "col.albumartist", 160, False), ("year", "col.year", 56, False),
+    ("genre", "col.genre", 110, False), ("time", "col.time", 56, True), ("format", "col.format", 112, True),
+    ("bitrate", "col.bitrate", 80, False), ("cover", "col.cover", 54, True), ("lyrics", "col.lyrics", 52, True),
+    ("fav", "col.fav", 34, False), ("rating", "col.rating", 92, True), ("plays", "col.plays", 54, True),
+    ("added", "col.added", 98, False), ("last", "col.last", 128, False), ("path", "col.path", 320, False),
+]
+COL_IDS = [c[0] for c in COLUMNS]
+EDITABLE = {"no": "track", "title": "title", "artist": "artist", "album": "album", "albumartist": "albumartist",
+            "year": "year", "genre": "genre"}
+CENTERED = {"no", "time", "cover", "lyrics", "fav", "plays", "year"}
+MUTED_COLS = {"no", "time", "format", "bitrate", "plays", "added", "last", "path", "year"}
+
+
+def _date(ts, with_time=False):
+    if not ts:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d", time.localtime(ts))
+
+
 class TrackModel(QAbstractTableModel):
-    COLS = ["col.no", "col.title", "col.artist", "col.album", "col.time", "col.format", "col.cover", "col.lyrics",
-            "col.rating", "col.plays"]
+    """Rows are dicts from cm_library. edit_hook(row, field, value) -> updated row dict or None (when the tag
+    could not be written); paths_hook() is not needed - drag data comes straight from the rows."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows = []
         self.playing = None
+        self.edit_hook = None
+        self.sort_col, self.sort_order = None, Qt.AscendingOrder
 
     def set_rows(self, rows):
         self.beginResetModel()
         self.rows = rows
+        if self.sort_col is not None:
+            self._sort_rows(self.sort_col, self.sort_order)
         self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.rows)
 
     def columnCount(self, parent=QModelIndex()):
-        return len(self.COLS)
+        return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            return tr(self.COLS[section])
+            return tr(COLUMNS[section][1])
+        if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
+            return tr("col.tip")
         return None
 
     def set_playing(self, path):
         self.playing = path
         if self.rows:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, len(self.COLS) - 1))
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, len(COLUMNS) - 1))
+
+    def row_changed(self, i):
+        if 0 <= i < len(self.rows):
+            self.dataChanged.emit(self.index(i, 0), self.index(i, len(COLUMNS) - 1))
+
+    def find(self, path):
+        for i, r in enumerate(self.rows):
+            if r["path"] == path:
+                return i
+        return -1
+
+    def flags(self, index):
+        f = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
+        if index.isValid() and COL_IDS[index.column()] in EDITABLE and not self.rows[index.row()].get("missing"):
+            f |= Qt.ItemIsEditable
+        return f
+
+    def _text(self, r, cid):
+        if cid == "no":
+            return str(r["track_no"]) if r.get("track_no") else ""
+        if cid == "title":
+            return r.get("title") or os.path.basename(r["path"])
+        if cid in ("artist", "album", "albumartist", "genre", "year"):
+            return str(r.get(cid) or "")
+        if cid == "time":
+            return fmt_time(r["duration"]) if r.get("duration") else ""
+        if cid == "format":
+            parts = [r.get("codec") or ""]
+            if r.get("bits") and r.get("samplerate"):
+                parts.append(f'{r["bits"]}/{r["samplerate"] // 1000}')
+            elif r.get("bitrate"):
+                parts.append(f'{r["bitrate"]} kbps')
+            return " ".join(p for p in parts if p)
+        if cid == "bitrate":
+            return f'{r["bitrate"]} kbps' if r.get("bitrate") else ""
+        if cid == "cover":
+            return "✓" if r.get("has_cover") else "—"
+        if cid == "lyrics":
+            return "✓" if r.get("has_lyrics") else "—"
+        if cid == "fav":
+            return "♥" if r.get("favourite") else "♡"
+        if cid == "rating":
+            return ""
+        if cid == "plays":
+            return str(r.get("play_count") or "")
+        if cid == "added":
+            return _date(r.get("added"))
+        if cid == "last":
+            return _date(r.get("last_played"), True)
+        if cid == "path":
+            return r["path"]
+        return ""
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
         r = self.rows[index.row()]
-        col = index.column()
+        cid = COL_IDS[index.column()]
         playing = r["path"] == self.playing
+        missing = bool(r.get("missing"))
         if role == Qt.DisplayRole:
-            if col == 0:
-                return "▶" if playing else (str(r["track_no"]) if r.get("track_no") else "")
-            if col == 1:
-                return r.get("title") or os.path.basename(r["path"])
-            if col == 2:
-                return r.get("artist") or ""
-            if col == 3:
-                return r.get("album") or ""
-            if col == 4:
-                return fmt_time(r["duration"]) if r.get("duration") else ""
-            if col == 5:
-                parts = [r.get("codec") or ""]
-                if r.get("bits") and r.get("samplerate"):
-                    parts.append(f'{r["bits"]}/{r["samplerate"] // 1000}')
-                elif r.get("bitrate"):
-                    parts.append(f'{r["bitrate"]} kbps')
-                return " ".join(p for p in parts if p)
-            if col == 6:
-                return "✓" if r.get("has_cover") else "—"
-            if col == 7:
-                return "✓" if r.get("has_lyrics") else "—"
-            if col == 8:
-                n = int(r.get("rating") or 0)
-                return ("♥ " if r.get("favourite") else "") + "★" * n + "☆" * (5 - n)
-            if col == 9:
-                return str(r.get("play_count") or "")
+            if cid == "no" and playing:
+                return "▶"
+            if cid == "title" and missing:
+                return "⚠ " + self._text(r, cid)
+            return self._text(r, cid)
+        if role == Qt.EditRole:
+            if cid == "no":
+                return str(r.get("track_no") or "")
+            return self._text(r, cid)
+        if role == Qt.UserRole:
+            return int(r.get("rating") or 0)
         if role == Qt.ForegroundRole:
             c = cm_theme.colours()
-            if playing and col in (0, 1):
-                return QColor(c["accent"])
-            if col in (6, 7):
-                return QColor("#16a34a") if (r.get("has_cover") if col == 6 else r.get("has_lyrics")) else QColor(c["muted"])
-            if col == 8:
-                return QColor("#f5a524")
-            if col in (0, 4, 5, 9):
+            if missing:
                 return QColor(c["muted"])
-        if role == Qt.FontRole and playing:
+            if playing and cid in ("no", "title"):
+                return QColor(c["accent"])
+            if cid in ("cover", "lyrics"):
+                on = r.get("has_cover") if cid == "cover" else r.get("has_lyrics")
+                return QColor("#16a34a") if on else QColor(c["muted"])
+            if cid == "fav":
+                return QColor("#e5484d") if r.get("favourite") else QColor(c["muted"])
+            if cid in MUTED_COLS:
+                return QColor(c["muted"])
+        if role == Qt.FontRole and (playing or missing):
             f = QFont()
-            f.setBold(True)
+            f.setBold(playing)
+            f.setItalic(missing)
             return f
-        if role == Qt.TextAlignmentRole and col in (0, 4, 6, 7, 9):
+        if role == Qt.TextAlignmentRole and cid in CENTERED:
             return int(Qt.AlignCenter)
         if role == Qt.ToolTipRole:
+            if missing:
+                return tr("lib.missing_tip", path=r["path"])
+            if cid == "rating":
+                return tr("col.rating_tip")
+            if cid == "fav":
+                return tr("col.fav_tip")
             return r["path"]
         return None
 
+    def setData(self, index, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid() or self.edit_hook is None:
+            return False
+        cid = COL_IDS[index.column()]
+        if cid not in EDITABLE:
+            return False
+        r = self.rows[index.row()]
+        value = str(value).strip()
+        if value == self.data(index, Qt.EditRole):
+            return False
+        new = self.edit_hook(r, EDITABLE[cid], value)
+        if not new:
+            return False
+        self.rows[index.row()] = new
+        self.row_changed(index.row())
+        return True
+
+    def mimeTypes(self):
+        return [TRACK_MIME]
+
+    def mimeData(self, indexes):
+        rows = sorted({i.row() for i in indexes})
+        return tracks_mime([self.rows[i]["path"] for i in rows if 0 <= i < len(self.rows)])
+
+    def supportedDragActions(self):
+        return Qt.CopyAction
+
+    SORT_KEYS = {
+        "no": lambda r: (r.get("disc_no") or 0, r.get("track_no") or 0),
+        "title": lambda r: (r.get("title") or "").lower(), "artist": lambda r: (r.get("artist") or "").lower(),
+        "album": lambda r: ((r.get("album") or "").lower(), r.get("disc_no") or 0, r.get("track_no") or 0),
+        "albumartist": lambda r: (r.get("albumartist") or "").lower(), "year": lambda r: str(r.get("year") or ""),
+        "genre": lambda r: (r.get("genre") or "").lower(), "time": lambda r: r.get("duration") or 0,
+        "format": lambda r: ((r.get("codec") or "").upper() in LOSSLESS, r.get("bits") or 0, r.get("bitrate") or 0),
+        "bitrate": lambda r: r.get("bitrate") or 0, "cover": lambda r: r.get("has_cover") or 0,
+        "lyrics": lambda r: r.get("has_lyrics") or 0, "fav": lambda r: r.get("favourite") or 0,
+        "rating": lambda r: (r.get("rating") or 0, r.get("favourite") or 0), "plays": lambda r: r.get("play_count") or 0,
+        "added": lambda r: r.get("added") or 0, "last": lambda r: r.get("last_played") or 0,
+        "path": lambda r: r["path"].lower(),
+    }
+
+    def _sort_rows(self, column, order):
+        key = self.SORT_KEYS.get(COL_IDS[column], self.SORT_KEYS["title"])
+        self.rows.sort(key=key, reverse=order == Qt.DescendingOrder)
+
     def sort(self, column, order=Qt.AscendingOrder):
-        keys = {0: lambda r: (r.get("disc_no") or 0, r.get("track_no") or 0), 1: lambda r: (r.get("title") or "").lower(),
-                2: lambda r: (r.get("artist") or "").lower(), 3: lambda r: ((r.get("album") or "").lower(), r.get("track_no") or 0),
-                4: lambda r: r.get("duration") or 0, 5: lambda r: (r.get("codec") or "", r.get("bitrate") or 0),
-                6: lambda r: r.get("has_cover") or 0, 7: lambda r: r.get("has_lyrics") or 0,
-                8: lambda r: (r.get("rating") or 0, r.get("favourite") or 0), 9: lambda r: r.get("play_count") or 0}
+        if column < 0:
+            self.sort_col = None
+            return
+        self.sort_col, self.sort_order = column, order
         self.layoutAboutToBeChanged.emit()
-        self.rows.sort(key=keys.get(column, keys[1]), reverse=order == Qt.DescendingOrder)
+        self._sort_rows(column, order)
         self.layoutChanged.emit()
 
 
+class StarDelegate(QStyledItemDelegate):
+    """Five stars; the rating column of the track table."""
+    STAR = 14
+
+    def paint(self, p, option, index):
+        self.initStyleOption(option, index)
+        option.text = ""
+        QApplication.style().drawControl(QStyle.CE_ItemViewItem, option, p, option.widget)
+        n = int(index.data(Qt.UserRole) or 0)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        f = QFont(option.font)
+        f.setPixelSize(13)
+        p.setFont(f)
+        x = option.rect.left() + 6
+        y = option.rect.top()
+        h = option.rect.height()
+        c = cm_theme.colours()
+        for i in range(5):
+            p.setPen(QColor("#f5a524") if i < n else QColor(c["border"]))
+            p.drawText(QRectF(x + i * self.STAR, y, self.STAR, h), Qt.AlignCenter, "★")
+        p.restore()
+
+    @classmethod
+    def star_at(cls, rect, x):
+        i = int((x - rect.left() - 6) // cls.STAR)
+        return i + 1 if 0 <= i < 5 else None
+
+
 class TrackTable(QTableView):
+    ratingClicked = Signal(dict, int)
+    favClicked = Signal(dict)
+    removeRequested = Signal()
+    trashRequested = Signal()
+    layoutSaved = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model_ = TrackModel(self)
@@ -776,22 +979,108 @@ class TrackTable(QTableView):
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setAlternatingRowColors(True)
         self.setShowGrid(False)
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         self.setSortingEnabled(True)
+        self.model_.sort_col = None
         self.setWordWrap(False)
-        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.setEditTriggers(QAbstractItemView.EditKeyPressed)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.verticalHeader().hide()
         self.verticalHeader().setDefaultSectionSize(30)
+        self.setItemDelegateForColumn(COL_IDS.index("rating"), StarDelegate(self))
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setDefaultDropAction(Qt.CopyAction)
         h = self.horizontalHeader()
         h.setHighlightSections(False)
         h.setStretchLastSection(False)
-        for col, w in enumerate([38, 200, 160, 180, 56, 116, 56, 50, 88, 52]):
-            self.setColumnWidth(col, w)
-        for col in (1, 2, 3):
-            h.setSectionResizeMode(col, h.ResizeMode.Stretch)
-        h.setMinimumSectionSize(36)
+        h.setSectionsMovable(True)
+        h.setMinimumSectionSize(30)
+        h.setContextMenuPolicy(Qt.CustomContextMenu)
+        h.customContextMenuRequested.connect(self._header_menu)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setDragEnabled(False)
+        self.reset_columns()
+        self._save_timer = QTimer(self, singleShot=True, interval=600, timeout=self._emit_layout)
+        h.sectionResized.connect(lambda *_: self._save_timer.start())
+        h.sectionMoved.connect(lambda *_: self._save_timer.start())
+
+    def reset_columns(self):
+        h = self.horizontalHeader()
+        for logical, (_cid, _key, width, shown) in enumerate(COLUMNS):
+            vis = h.visualIndex(logical)
+            if vis != logical:
+                h.moveSection(vis, logical)
+            self.setColumnWidth(logical, width)
+            self.setColumnHidden(logical, not shown)
+
+    def restore_layout(self, state):
+        """state: base64 of QHeaderView.saveState(), plus the column count it was made for."""
+        try:
+            count, data = state.split(":", 1)
+            if int(count) != len(COLUMNS):
+                return False
+            return self.horizontalHeader().restoreState(QByteArray.fromBase64(data.encode()))
+        except (ValueError, AttributeError):
+            return False
+
+    def layout_state(self):
+        return f"{len(COLUMNS)}:" + bytes(self.horizontalHeader().saveState().toBase64()).decode()
+
+    def _emit_layout(self):
+        self.layoutSaved.emit(self.layout_state())
+
+    def _header_menu(self, pos):
+        m = QMenu(self)
+        for logical, (cid, key, _w, _s) in enumerate(COLUMNS):
+            if cid == "title":
+                continue
+            a = m.addAction(tr(key) if cid != "no" else tr("col.track_no"))
+            a.setCheckable(True)
+            a.setChecked(not self.isColumnHidden(logical))
+            a.toggled.connect(lambda on, c=logical: (self.setColumnHidden(c, not on), self._emit_layout()))
+        m.addSeparator()
+        m.addAction(tr("col.reset"), lambda: (self.reset_columns(), self._emit_layout()))
+        m.exec(self.horizontalHeader().mapToGlobal(pos))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and not (e.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)):
+            idx = self.indexAt(e.position().toPoint())
+            if idx.isValid():
+                cid = COL_IDS[idx.column()]
+                row = self.model_.rows[idx.row()]
+                if cid == "rating":
+                    n = StarDelegate.star_at(self.visualRect(idx), e.position().x())
+                    if n is not None:
+                        self.selectRow(idx.row())
+                        self.ratingClicked.emit(row, 0 if n == int(row.get("rating") or 0) else n)
+                        return
+                elif cid == "fav":
+                    self.selectRow(idx.row())
+                    self.favClicked.emit(row)
+                    return
+        super().mousePressEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Delete and self.state() != QAbstractItemView.EditingState:
+            if e.modifiers() & Qt.ShiftModifier:
+                self.trashRequested.emit()
+            else:
+                self.removeRequested.emit()
+            return
+        if e.key() == Qt.Key_F2:
+            idx = self.currentIndex()
+            if idx.isValid() and not (self.model_.flags(idx) & Qt.ItemIsEditable):
+                idx = self.model_.index(idx.row(), COL_IDS.index("title"))
+                self.setCurrentIndex(idx)
+            if idx.isValid():
+                self.edit(idx)
+            return
+        super().keyPressEvent(e)
+
+    def clear_sort(self):
+        """Back to the library's own order (album / disc / track, or the playlist order)."""
+        self.model_.sort_col = None
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
 
     def selected_rows(self):
         return [self.model_.rows[i.row()] for i in sorted(self.selectionModel().selectedRows(), key=lambda i: i.row())]
@@ -800,32 +1089,149 @@ class TrackTable(QTableView):
         return [r["path"] for r in self.selected_rows()]
 
 
-class AlbumStrip(QListView):
+class TileModel(QStandardItemModel):
+    """Album / video tiles. resolver(list of item data) -> list of track paths (for dragging)."""
+    resolver = None
+
+    def mimeTypes(self):
+        return [TRACK_MIME]
+
+    def mimeData(self, indexes):
+        keys = [i.data(Qt.UserRole) for i in indexes if i.isValid()]
+        paths = self.resolver(keys) if self.resolver else []
+        return tracks_mime(paths)
+
+    def supportedDragActions(self):
+        return Qt.CopyAction
+
+
+class TileView(QListView):
+    """Album covers / video thumbnails: a single row ("strip") above the track list, or a full page ("grid")."""
+    removeRequested = Signal()
+    trashRequested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("AlbumStrip")
         self.setViewMode(QListView.IconMode)
-        self.setFlow(QListView.LeftToRight)
-        self.setWrapping(False)
-        self.setIconSize(QSize(124, 124))
-        self.setGridSize(QSize(146, 182))
-        self.setUniformItemSizes(True)
         self.setMovement(QListView.Static)
         self.setResizeMode(QListView.Adjust)
+        self.setUniformItemSizes(True)
         self.setWordWrap(True)
         self.setTextElideMode(Qt.ElideRight)
-        self.setFixedHeight(200)
-        self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setDefaultDropAction(Qt.CopyAction)
+        self.setSpacing(4)
+        self.mode = "strip"
+        self.tile = 124
+        self.wide = False
+        self.apply()
+
+    def configure(self, mode=None, tile=None, wide=None):
+        if mode is not None:
+            self.mode = mode
+        if tile is not None:
+            self.tile = max(72, min(260, int(tile)))
+        if wide is not None:
+            self.wide = wide
+        self.apply()
+
+    def icon_size(self):
+        return QSize(int(self.tile * 16 / 9), self.tile) if self.wide else QSize(self.tile, self.tile)
+
+    def apply(self):
+        ic = self.icon_size()
+        self.setIconSize(ic)
+        self.setGridSize(QSize(ic.width() + 22, ic.height() + 58))
+        if self.mode == "grid":
+            self.setFlow(QListView.LeftToRight)
+            self.setWrapping(True)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        else:
+            self.setFlow(QListView.LeftToRight)
+            self.setWrapping(False)
+            self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+            self.setFixedHeight(ic.height() + 76)
+        self.doItemsLayout()
 
     def wheelEvent(self, e):
-        # a normal mouse wheel scrolls the album strip sideways
-        bar = self.horizontalScrollBar()
-        bar.setValue(bar.value() - e.angleDelta().y() - e.angleDelta().x())
-        e.accept()
+        if e.modifiers() & Qt.ControlModifier:
+            # Ctrl + wheel changes the tile size
+            self.configure(tile=self.tile + (12 if e.angleDelta().y() > 0 else -12))
+            self.tileSizeChanged.emit(self.tile)
+            e.accept()
+            return
+        if self.mode == "strip":
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - e.angleDelta().y() - e.angleDelta().x())
+            e.accept()
+            return
+        super().wheelEvent(e)
+
+    tileSizeChanged = Signal(int)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Delete:
+            (self.trashRequested if e.modifiers() & Qt.ShiftModifier else self.removeRequested).emit()
+            return
+        super().keyPressEvent(e)
+
+
+class TileDelegate(QStyledItemDelegate):
+    """Normal tile painting plus a red "watched so far" bar under video thumbnails (item role UserRole + 2)."""
+    def paint(self, p, option, index):
+        super().paint(p, option, index)
+        progress = index.data(Qt.UserRole + 2) or 0
+        if not progress:
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        r = style.subElementRect(QStyle.SE_ItemViewItemDecoration, opt, opt.widget)
+        if r.width() <= 0:
+            return
+        p.save()
+        h = 4
+        p.fillRect(QRectF(r.left(), r.bottom() - h + 1, r.width(), h), QColor(0, 0, 0, 150))
+        p.fillRect(QRectF(r.left(), r.bottom() - h + 1, r.width() * min(1.0, float(progress)), h), QColor("#e5484d"))
+        p.restore()
+
+
+def tile_pixmap(pm, size, progress=0.0):
+    """Cover / thumbnail cut to the tile shape, with an optional "watched so far" bar."""
+    w, h = size.width(), size.height()
+    ratio = 2.0
+    out = QPixmap(int(w * ratio), int(h * ratio))
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, out.width(), out.height()), 8 * ratio, 8 * ratio)
+    p.setClipPath(path)
+    src = pm.scaled(out.width(), out.height(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    p.drawPixmap(int((out.width() - src.width()) / 2), int((out.height() - src.height()) / 2), src)
+    if progress > 0:
+        bar_h = 5 * ratio
+        p.fillRect(QRectF(0, out.height() - bar_h, out.width(), bar_h), QColor(0, 0, 0, 150))
+        p.fillRect(QRectF(0, out.height() - bar_h, out.width() * min(1.0, progress), bar_h), QColor("#e5484d"))
+    p.end()
+    out.setDevicePixelRatio(ratio)
+    return out
 
 
 class SideList(QListWidget):
+    """The sidebar. Tracks dragged from the library can be dropped on a playlist, on "New playlist"
+    or on Favourites."""
+    tracksDropped = Signal(object, list)
+    DROP_KINDS = ("playlist", "newpl", "fav")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("SideList")
@@ -833,6 +1239,9 @@ class SideList(QListWidget):
         self.setFocusPolicy(Qt.NoFocus)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(False)
+        self._hover = None
 
     def heading(self, key):
         it = QListWidgetItem(tr(key).upper())
@@ -847,12 +1256,157 @@ class SideList(QListWidget):
         self.addItem(it)
         return it
 
-    def entry(self, text, icon, data, count=None):
+    def entry(self, text, icon, data, count=None, warn=False):
         it = QListWidgetItem(icon, text + (f"   ({count})" if count else ""))
         it.setData(Qt.UserRole, data)
         it.setSizeHint(QSize(10, 32))
+        if warn:
+            it.setForeground(QColor("#d97706"))
         self.addItem(it)
         return it
+
+    def _target(self, pos):
+        it = self.itemAt(pos)
+        data = it.data(Qt.UserRole) if it else None
+        if data and (data[0] in self.DROP_KINDS or data == ("view", "favourites")):
+            return it
+        return None
+
+    def _set_hover(self, it):
+        if self._hover is it:
+            return
+        if self._hover is not None:
+            try:
+                self._hover.setBackground(QColor(0, 0, 0, 0))
+            except RuntimeError:
+                pass
+        self._hover = it
+        if it is not None:
+            it.setBackground(QColor(cm_theme.colours()["accentSoft"]))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(TRACK_MIME):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        it = self._target(e.position().toPoint())
+        self._set_hover(it)
+        if it is not None:
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._set_hover(None)
+
+    def dropEvent(self, e):
+        it = self._target(e.position().toPoint())
+        self._set_hover(None)
+        paths = paths_from_mime(e.mimeData())
+        if it is not None and paths:
+            e.acceptProposedAction()
+            self.tracksDropped.emit(it.data(Qt.UserRole), paths)
+        else:
+            e.ignore()
+
+
+class QueueList(QListWidget):
+    """The "Up next" list: reorder by dragging, and drop tracks from the library on it."""
+    tracksDropped = Signal(list, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Queue")
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setIconSize(QSize(36, 36))
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(TRACK_MIME):
+            e.acceptProposedAction()
+            return
+        super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(TRACK_MIME):
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if e.mimeData().hasFormat(TRACK_MIME):
+            it = self.itemAt(e.position().toPoint())
+            row = self.row(it) if it is not None else self.count()
+            e.acceptProposedAction()
+            self.tracksDropped.emit(paths_from_mime(e.mimeData()), row)
+            return
+        super().dropEvent(e)
+
+
+class FolderTree(QTreeWidget):
+    """Library folders as a tree (Browse > Folders)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FolderTree")
+        self.setHeaderHidden(True)
+        self.setFixedWidth(260)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.setUniformRowHeights(True)
+        self.setAnimated(False)
+        self.setExpandsOnDoubleClick(True)
+
+    def load(self, folders, roots, other_label, icon):
+        """folders: [(folder, n)] ; roots: library folders."""
+        self.clear()
+        norm_roots = sorted({os.path.normpath(r) for r in roots}, key=len, reverse=True)
+        nodes = {}
+
+        def node_for(path, parent, label):
+            key = os.path.normcase(path)
+            if key in nodes:
+                return nodes[key]
+            it = QTreeWidgetItem(parent, [label])
+            it.setData(0, Qt.UserRole, path)
+            it.setData(0, Qt.UserRole + 1, 0)
+            it.setIcon(0, icon)
+            it.setToolTip(0, path)
+            nodes[key] = it
+            return it
+
+        other = None
+        for folder, n in folders:
+            folder = os.path.normpath(folder)
+            root = next((r for r in norm_roots if os.path.normcase(folder) == os.path.normcase(r) or
+                         os.path.normcase(folder).startswith(os.path.normcase(r).rstrip("\\/") + os.sep)), None)
+            if root is None:
+                if other is None:
+                    other = QTreeWidgetItem(self, [other_label])
+                    other.setData(0, Qt.UserRole, None)
+                    other.setData(0, Qt.UserRole + 1, 0)
+                leaf = node_for(folder, other, folder)
+                chain = [leaf]
+            else:
+                parent = node_for(root, self, root)
+                chain = [parent]
+                rel = os.path.relpath(folder, root)
+                if rel != ".":
+                    cur = root
+                    for part in rel.split(os.sep):
+                        cur = os.path.join(cur, part)
+                        parent = node_for(cur, parent, part)
+                        chain.append(parent)
+            for it in chain:
+                it.setData(0, Qt.UserRole + 1, (it.data(0, Qt.UserRole + 1) or 0) + n)
+            if other is not None and root is None:
+                other.setData(0, Qt.UserRole + 1, (other.data(0, Qt.UserRole + 1) or 0) + n)
+        for it in list(nodes.values()) + ([other] if other else []):
+            it.setText(0, f"{it.text(0)}  ({it.data(0, Qt.UserRole + 1)})")
+        self.sortItems(0, Qt.AscendingOrder)
+        for i in range(self.topLevelItemCount()):
+            self.topLevelItem(i).setExpanded(True)
 
 
 def make_action(parent, key, glyph, colour, slot, shortcut=None, checkable=False):
