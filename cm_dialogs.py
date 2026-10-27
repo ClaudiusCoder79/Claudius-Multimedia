@@ -57,6 +57,23 @@ class Dialog(QDialog):
 
 
 # ------------------------------------------------------------------ cover picker
+def cover_search_fields(path, info=None):
+    """(artist, album, title) to search covers with: the tags, or - when they are empty - what the file name
+    ("01 - Artist - Title.mp3") and the folder name ("Artist - Album") say."""
+    info = info if info is not None else (cm_tags.read(path) if path and os.path.isfile(path) else {})
+    guess = title_from_filename(path) if path else {}
+    artist = (info.get("artist") or info.get("albumartist") or guess.get("artist") or "").strip()
+    title = (info.get("title") or guess.get("title") or "").strip()
+    album = (info.get("album") or "").strip()
+    if path and (not artist or not album):
+        folder = os.path.basename(os.path.dirname(path))
+        parts = [x.strip() for x in folder.split(" - ", 1)] if " - " in folder else []
+        if len(parts) == 2:
+            artist = artist or parts[0]
+            album = album or re.sub(r"^\(?\d{4}\)?\s*", "", parts[1])
+    return artist, album, title
+
+
 class CoverPicker(Dialog):
     """Searches iTunes, Deezer and Cover Art Archive and returns the chosen image bytes in .result_data."""
     def __init__(self, parent, artist, album, title=""):
@@ -70,15 +87,20 @@ class CoverPicker(Dialog):
         lay = QVBoxLayout(self)
         row = QHBoxLayout()
         self.artist = QLineEdit(artist)
-        self.album = QLineEdit(album or title)
-        self.artist.setPlaceholderText(tr("field.artist"))
-        self.album.setPlaceholderText(tr("field.album"))
+        self.title = QLineEdit(title)
+        self.album = QLineEdit(album)
+        for edit, key in ((self.artist, "field.artist"), (self.title, "field.title"), (self.album, "field.album")):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.addWidget(muted(tr(key)))
+            edit.setPlaceholderText(tr(key))
+            edit.setClearButtonEnabled(True)
+            edit.returnPressed.connect(self.search)
+            col.addWidget(edit)
+            row.addLayout(col, 1)
         search = QPushButton(tr("btn.search"))
         search.clicked.connect(self.search)
-        self.album.returnPressed.connect(self.search)
-        row.addWidget(self.artist, 1)
-        row.addWidget(self.album, 1)
-        row.addWidget(search)
+        row.addWidget(search, 0, Qt.AlignBottom)
         lay.addLayout(row)
         self.status = muted(tr("cover.sources"))
         lay.addWidget(self.status)
@@ -104,8 +126,8 @@ class CoverPicker(Dialog):
         self.grid.clear()
         self.cands = []
         self.status.setText(tr("msg.searching"))
-        cm_online.run(cm_online.cover_candidates, self.artist.text(), self.album.text(),
-                      done=lambda cands: self._found(cands, gen),
+        cm_online.run(cm_online.cover_candidates, self.artist.text().strip(), self.album.text().strip(),
+                      self.title.text().strip(), done=lambda cands: self._found(cands, gen),
                       failed=lambda m: gen == self.generation and self.status.setText(tr("msg.online_error", error=m)))
 
     def _found(self, cands, gen):
@@ -529,8 +551,10 @@ class TagEditor(Dialog):
     def cover_online(self):
         if not ask_online(self):
             return
-        dlg = CoverPicker(self, self._val("albumartist") or self._val("artist") or self.infos[0]["artist"],
-                          self._val("album") or self.infos[0]["album"], self._val("title"))
+        guess = cover_search_fields(self.paths[0], dict(self.infos[0], artist=self._val("artist"),
+                                                        albumartist=self._val("albumartist"),
+                                                        album=self._val("album"), title=self._val("title")))
+        dlg = CoverPicker(self, *guess)
         ok = dlg.exec()
         data = dlg.result_data
         dlg.deleteLater()

@@ -1,4 +1,4 @@
-Claudius Multimedia 1.1.1 - music & video player for Windows 11 (64-bit)
+Claudius Multimedia 1.1.2 - music & video player for Windows 11 (64-bit)
 Created by Michal Czapla & Claude AI.  Freeware (GNU GPL v3).
 https://github.com/ClaudiusCoder79/Claudius-Multimedia
 
@@ -37,7 +37,8 @@ TIDYING THE LIBRARY
   Tools > Back up saves ratings, play counts, playlists and settings in one .cmbackup file.
 
 COVERS AND LYRICS
-  Find cover searches iTunes, Deezer and MusicBrainz / Cover Art Archive.
+  Find cover searches iTunes, Deezer and MusicBrainz / Cover Art Archive. Artist, title and album are
+  filled in from the tags (or the file and folder name) - change them and press Enter to search again.
   Find lyrics searches LRCLIB; synced lyrics scroll with the music - click a line to jump.
   Library > Missing covers / Missing lyrics fetch them for many tracks at once.
   Only artist, album, title and length are sent. Switch this off in Settings > Online.

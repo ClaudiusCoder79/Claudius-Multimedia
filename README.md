@@ -31,9 +31,9 @@ PotPlayer / VLC. Ribbon interface with System / Light / Dark theme and six langu
 ## Download the installer (built by GitHub)
 
 1. Open the **Actions** tab -> latest green run of "Build Claudius Multimedia for Windows" -> **Artifacts**
-   -> download `Claudius-Multimedia-installer` (Claudius-Multimedia-Setup-1.1.1.exe) or
+   -> download `Claudius-Multimedia-installer` (Claudius-Multimedia-Setup-1.1.2.exe) or
    `Claudius-Multimedia-windows-x64` (portable zip: unzip anywhere, start `Claudius Multimedia.exe`).
-2. Or, for a public download page: create a tag `v1.1.1` (see below); the installer then appears under **Releases**.
+2. Or, for a public download page: create a tag `v1.1.2` (see below); the installer then appears under **Releases**.
 
 The installer puts the program in `C:\Program Files (x86)\Claudius Multimedia`, creates the Start Menu folder
 **Claudius Multimedia** (program, Uninstall, Freeware notice, Read me), an optional desktop icon and optional
@@ -68,14 +68,14 @@ Online look-ups send only artist, album, title and length, and can be switched o
    Easiest: `git clone`, copy the files in, then `git add . && git commit -m "Claudius Multimedia 1.1.0" && git push`.
 3. Push to `main` -> the build starts automatically (Actions tab, about 10 minutes). Also use *Run workflow* to start it by hand.
    The build also starts the finished program once (`--selftest`) to check that it opens and plays a test tone.
-4. Release: `git tag v1.1.1 && git push origin v1.1.1` -> the workflow also creates a GitHub Release with
-   `Claudius-Multimedia-Setup-1.1.1.exe`, `Claudius-Multimedia-portable-1.1.1.zip` and `SHA256SUMS.txt`.
+4. Release: `git tag v1.1.2 && git push origin v1.1.2` -> the workflow also creates a GitHub Release with
+   `Claudius-Multimedia-Setup-1.1.2.exe`, `Claudius-Multimedia-portable-1.1.2.zip` and `SHA256SUMS.txt`.
 
 ## Build on your own PC
 
 * Run from source: install Python 3.12 (64-bit), then `python -m pip install -r requirements.txt` and `python claudius_multimedia.py` (or `run.bat`).
 * EXE: `build_exe.bat` -> `dist\Claudius Multimedia\Claudius Multimedia.exe` (a folder; keep it together).
-* Installer: `build_installer.bat` (needs the free Inno Setup 6) -> `installer\Claudius-Multimedia-Setup-1.1.1.exe`.
+* Installer: `build_installer.bat` (needs the free Inno Setup 6) -> `installer\Claudius-Multimedia-Setup-1.1.2.exe`.
 
 ## Keyboard shortcuts
 

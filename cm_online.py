@@ -102,39 +102,65 @@ def lyrics_search(artist, title):
 
 # ---------------------------------------------------------------- covers
 def cover_candidates(artist, album, title=""):
-    """List of dicts: source, label, url (full size), thumb (small). Errors of one service do not stop the others."""
-    out, errors = [], []
-    term = " ".join(x for x in (artist, album or title) if x)
-    try:
-        q = urllib.parse.urlencode({"term": term, "entity": "album", "limit": 6})
+    """List of dicts: source, label, url (full size), thumb (small). Searches by album when there is one and by the
+    track title (the cover of the album the song is on), so a file with only artist + title still finds covers.
+    Errors of one service do not stop the others."""
+    out, errors, seen = [], [], set()
+
+    def add(source, label, url, thumb):
+        if url and url not in seen:
+            seen.add(url)
+            out.append({"source": source, "label": label, "url": url, "thumb": thumb or url})
+
+    def itunes(entity, words, limit):
+        q = urllib.parse.urlencode({"term": " ".join(w for w in words if w), "entity": entity, "limit": limit})
         for r in (_get("https://itunes.apple.com/search?" + q) or {}).get("results", []):
             art = r.get("artworkUrl100")
             if art:
-                out.append({"source": "iTunes", "label": f'{r.get("artistName", "")} - {r.get("collectionName", "")}',
-                            "url": art.replace("100x100bb", "1200x1200bb"), "thumb": art.replace("100x100bb", "300x300bb")})
-    except OnlineError as e:
-        errors.append(str(e))
-    try:
-        q = urllib.parse.urlencode({"q": f'artist:"{_q(artist)}" album:"{_q(album or title)}"', "limit": 6})
+                add("iTunes", f'{r.get("artistName", "")} - {r.get("collectionName", "")}',
+                    art.replace("100x100bb", "1200x1200bb"), art.replace("100x100bb", "300x300bb"))
+
+    def deezer_album():
+        q = urllib.parse.urlencode({"q": f'artist:"{_q(artist)}" album:"{_q(album)}"' if artist else f'album:"{_q(album)}"',
+                                    "limit": 6})
         for r in (_get("https://api.deezer.com/search/album?" + q) or {}).get("data", []):
-            if r.get("cover_xl"):
-                out.append({"source": "Deezer", "label": f'{(r.get("artist") or {}).get("name", "")} - {r.get("title", "")}',
-                            "url": r["cover_xl"], "thumb": r.get("cover_medium") or r["cover_xl"]})
-    except OnlineError as e:
-        errors.append(str(e))
-    try:
-        if album:
-            q = urllib.parse.urlencode({"query": f'release:"{_q(album)}" AND artist:"{_q(artist)}"', "fmt": "json", "limit": 4})
-            for r in (_mb("https://musicbrainz.org/ws/2/release/?" + q) or {}).get("releases", []):
-                mbid = r.get("id")
-                if mbid and (r.get("cover-art-archive") or {}).get("front", True):
-                    out.append({"source": "Cover Art Archive", "label": f'{r.get("title", "")} ({r.get("date", "")[:4]})',
-                                "url": f"https://coverartarchive.org/release/{mbid}/front-1200",
-                                "thumb": f"https://coverartarchive.org/release/{mbid}/front-250"})
-    except OnlineError as e:
-        errors.append(str(e))
+            add("Deezer", f'{(r.get("artist") or {}).get("name", "")} - {r.get("title", "")}', r.get("cover_xl"),
+                r.get("cover_medium"))
+
+    def deezer_track():
+        q = urllib.parse.urlencode({"q": f'artist:"{_q(artist)}" track:"{_q(title)}"' if artist else f'track:"{_q(title)}"',
+                                    "limit": 8})
+        for r in (_get("https://api.deezer.com/search?" + q) or {}).get("data", []):
+            al = r.get("album") or {}
+            add("Deezer", f'{(r.get("artist") or {}).get("name", "")} - {al.get("title", "")}', al.get("cover_xl"),
+                al.get("cover_medium"))
+
+    def musicbrainz():
+        q = urllib.parse.urlencode({"query": f'release:"{_q(album)}"' + (f' AND artist:"{_q(artist)}"' if artist else ""),
+                                    "fmt": "json", "limit": 4})
+        for r in (_mb("https://musicbrainz.org/ws/2/release/?" + q) or {}).get("releases", []):
+            mbid = r.get("id")
+            if mbid and (r.get("cover-art-archive") or {}).get("front", True):
+                add("Cover Art Archive", f'{r.get("title", "")} ({(r.get("date") or "")[:4]})',
+                    f"https://coverartarchive.org/release/{mbid}/front-1200",
+                    f"https://coverartarchive.org/release/{mbid}/front-250")
+
+    jobs = []
+    if album:
+        jobs += [lambda: itunes("album", (artist, album), 6), deezer_album]
+    if title:
+        jobs += [lambda: itunes("song", (artist, title), 8), deezer_track]
+    if not album and not title and artist:
+        jobs += [lambda: itunes("album", (artist,), 10)]
+    if album:
+        jobs.append(musicbrainz)
+    for job in jobs:
+        try:
+            job()
+        except OnlineError as e:
+            errors.append(str(e))
     if not out and errors:
-        raise OnlineError("\n".join(errors))
+        raise OnlineError("\n".join(dict.fromkeys(errors)))
     return out
 
 

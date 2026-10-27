@@ -2504,9 +2504,7 @@ class MainWindow(QMainWindow):
         if not paths:
             self.message(tr("msg.select_first"))
             return
-        info = cm_tags.read(paths[0])
-        dlg = cm_dialogs.CoverPicker(self, info.get("albumartist") or info.get("artist", ""), info.get("album", ""),
-                                     info.get("title", ""))
+        dlg = cm_dialogs.CoverPicker(self, *cm_dialogs.cover_search_fields(paths[0]))
         ok = dlg.exec()
         data = dlg.result_data
         dlg.deleteLater()
