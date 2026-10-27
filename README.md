@@ -103,6 +103,6 @@ Online look-ups send only artist, album, title and length, and can be switched o
 | `tools/check_translations.py` | checks that every language has every text |
 | `docs/` | screenshots of the program and the original design mock-ups |
 
-If something goes wrong, the program writes the details to `%APPDATA%\\Claudius Multimedia\\claudius.log`.
+If something goes wrong, the program writes the details to `%APPDATA%\Claudius Multimedia\claudius.log`.
 Settings, library database and cover / thumbnail cache are stored in `%APPDATA%\Claudius Multimedia`.
 A 1.0 library is upgraded automatically the first time 1.1 starts.
