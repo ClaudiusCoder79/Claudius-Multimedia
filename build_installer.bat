@@ -17,5 +17,5 @@ if "%ISCC%"=="" (
 )
 "%ISCC%" installer.iss
 echo.
-echo Done. Your installer is in the "installer" folder: Claudius-Multimedia-Setup-1.1.0.exe
+echo Done. Your installer is in the "installer" folder: Claudius-Multimedia-Setup-1.1.1.exe
 pause

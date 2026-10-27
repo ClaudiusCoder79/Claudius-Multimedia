@@ -222,5 +222,6 @@
   "stats.tracks": "Pistas", "stats.videos": "Vídeos", "tab.tools": "Herramientas", "tag.bad_track": "Número de pista: escribe 3 o 3/12",
   "tag.bad_year": "Año: cuatro cifras, p. ej. 2024", "tag.cannot_write": "No se pueden guardar etiquetas en este tipo de archivo.",
   "act.browse_folders": "Carpetas",
-  "sc.start_over": "Empezar el vídeo desde el principio", "sc.rename": "Renombrar el título (biblioteca)"
+  "sc.start_over": "Empezar el vídeo desde el principio", "sc.rename": "Renombrar el título (biblioteca)",
+  "msg.not_image": "El archivo descargado no es una imagen. Prueba otra portada."
 }

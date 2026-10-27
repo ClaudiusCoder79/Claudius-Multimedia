@@ -222,5 +222,6 @@
   "stats.videos": "Videos", "tab.tools": "Werkzeuge", "tag.bad_track": "Titelnummer: 3 oder 3/12 eingeben", "tag.bad_year": "Jahr: vier Ziffern, z. B. 2024",
   "tag.cannot_write": "In diesem Dateityp können keine Tags gespeichert werden.",
   "act.browse_folders": "Ordner",
-  "sc.start_over": "Video von vorn beginnen", "sc.rename": "Titel umbenennen (Bibliothek)"
+  "sc.start_over": "Video von vorn beginnen", "sc.rename": "Titel umbenennen (Bibliothek)",
+  "msg.not_image": "Die heruntergeladene Datei ist kein Bild. Wähle ein anderes Cover."
 }

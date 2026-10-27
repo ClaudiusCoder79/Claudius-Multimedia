@@ -219,5 +219,6 @@
   "stats.tracks": "Brani", "stats.videos": "Video", "tab.tools": "Strumenti", "tag.bad_track": "Numero traccia: scrivi 3 o 3/12",
   "tag.bad_year": "Anno: quattro cifre, es. 2024", "tag.cannot_write": "Non è possibile salvare i tag in questo tipo di file.",
   "act.browse_folders": "Cartelle",
-  "sc.start_over": "Riavvia il video dall'inizio", "sc.rename": "Rinomina il titolo (libreria)"
+  "sc.start_over": "Riavvia il video dall'inizio", "sc.rename": "Rinomina il titolo (libreria)",
+  "msg.not_image": "Il file scaricato non è un'immagine. Prova un'altra copertina."
 }

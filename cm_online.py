@@ -8,6 +8,8 @@ playing track when "auto lyrics" is on). Sends only artist / album / title / dur
   - Deezer            https://api.deezer.com       covers
 """
 import json
+import os
+import queue
 import threading
 import time
 import traceback
@@ -15,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
+from PySide6.QtCore import QObject, Qt, Signal, Slot
 
 from cm_core import USER_AGENT
 
@@ -189,63 +191,99 @@ def musicbrainz_lookup(artist, title, album="", duration=0):
 
 
 # ---------------------------------------------------------------- running work in the background
-class _Signals(QObject):
-    done = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int, int, str)
+class _Dispatcher(QObject):
+    """Lives on the GUI thread for the whole run of the program and is never deleted. Workers hand it small
+    functions (results, progress) that it runs on the GUI thread. Nothing Qt-related is created or destroyed on a
+    worker thread - that was the cause of crashes when many downloads (e.g. a cover search) finished together."""
+    call = Signal(object)
 
-
-class Task(QRunnable):
-    """Runs fn(*args) on a worker thread; done/failed are delivered on the GUI thread."""
-    _alive = set()
-
-    def __init__(self, fn, *args, with_progress=False):
+    def __init__(self):
         super().__init__()
-        self.fn, self.args, self.with_progress = fn, args, with_progress
-        self.signals = _Signals()
-        self.cancelled = False
-        self.setAutoDelete(True)
+        self.call.connect(self._run, Qt.QueuedConnection)
 
-    def run(self):
+    @Slot(object)
+    def _run(self, fn):
         try:
-            if self.with_progress:
+            fn()
+        except RuntimeError:
+            pass        # the window / item that asked for the result was closed meanwhile
+        except Exception:
+            traceback.print_exc()
+
+
+_dispatcher = None
+_jobs = queue.Queue()
+_workers = []
+_workers_lock = threading.Lock()
+WORKERS = max(4, min(8, os.cpu_count() or 4))
+
+
+def _to_gui(fn):
+    try:
+        _dispatcher.call.emit(fn)
+    except RuntimeError:
+        pass            # program is closing
+
+
+def _worker():
+    while True:
+        task = _jobs.get()
+        try:
+            task.execute()
+        except Exception:
+            traceback.print_exc()
+
+
+def _ensure_workers():
+    with _workers_lock:
+        while len(_workers) < WORKERS:
+            t = threading.Thread(target=_worker, name=f"claudius-worker-{len(_workers)}", daemon=True)
+            t.start()
+            _workers.append(t)
+
+
+class Task:
+    """fn(*args) on a background thread; done(result) / failed(message) / progress(i, n, text) are called on the
+    GUI thread. Long jobs get progress= and task= arguments and stop early when task.cancelled is set."""
+
+    def __init__(self, fn, args, done=None, failed=None, progress=None):
+        self.fn, self.args = fn, args
+        self.done_cb, self.failed_cb, self.progress_cb = done, failed, progress
+        self.cancelled = False
+
+    def execute(self):
+        try:
+            if self.progress_cb is not None:
                 result = self.fn(*self.args, progress=self._progress, task=self)
             else:
                 result = self.fn(*self.args)
         except OnlineError as e:
-            self._emit_fail(str(e))
+            self._fail(str(e))
         except Exception as e:  # keep the program running whatever happens in the worker
             traceback.print_exc()
-            self._emit_fail(f"{type(e).__name__}: {e}")
+            self._fail(f"{type(e).__name__}: {e}")
         else:
-            try:
-                self.signals.done.emit(result)
-            except RuntimeError:
-                pass
-        finally:
-            Task._alive.discard(self)
+            if self.done_cb is not None:
+                cb = self.done_cb
+                _to_gui(lambda: cb(result))
 
-    def _emit_fail(self, msg):
-        try:
-            self.signals.failed.emit(msg)
-        except RuntimeError:
-            pass
+    def _fail(self, msg):
+        if self.failed_cb is not None:
+            cb = self.failed_cb
+            _to_gui(lambda: cb(msg))
 
     def _progress(self, i, n, text=""):
-        try:
-            self.signals.progress.emit(i, n, text)
-        except RuntimeError:
-            pass
+        if self.progress_cb is not None:
+            cb = self.progress_cb
+            _to_gui(lambda: cb(i, n, text))
 
 
 def run(fn, *args, done=None, failed=None, progress=None):
-    task = Task(fn, *args, with_progress=progress is not None)
-    if done:
-        task.signals.done.connect(done)
-    if failed:
-        task.signals.failed.connect(failed)
-    if progress:
-        task.signals.progress.connect(progress)
-    Task._alive.add(task)
-    QThreadPool.globalInstance().start(task)
+    """Start fn(*args) in the background. Must be called from the GUI thread."""
+    global _dispatcher
+    if _dispatcher is None:
+        _dispatcher = _Dispatcher()
+    _ensure_workers()
+    task = Task(fn, args, done, failed, progress)
+    _jobs.put(task)
     return task

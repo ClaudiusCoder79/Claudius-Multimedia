@@ -64,6 +64,9 @@ class CoverPicker(Dialog):
         self.resize(820, 560)
         self.result_data = None
         self.cands = []
+        self.closed = False
+        self.busy = False
+        self.generation = 0
         lay = QVBoxLayout(self)
         row = QHBoxLayout()
         self.artist = QLineEdit(artist)
@@ -96,13 +99,17 @@ class CoverPicker(Dialog):
         self.search()
 
     def search(self):
+        self.generation = getattr(self, "generation", 0) + 1      # results of an older search are ignored
+        gen = self.generation
         self.grid.clear()
+        self.cands = []
         self.status.setText(tr("msg.searching"))
         cm_online.run(cm_online.cover_candidates, self.artist.text(), self.album.text(),
-                      done=self._found, failed=lambda m: self.status.setText(tr("msg.online_error", error=m)))
+                      done=lambda cands: self._found(cands, gen),
+                      failed=lambda m: gen == self.generation and self.status.setText(tr("msg.online_error", error=m)))
 
-    def _found(self, cands):
-        if not self.isVisible() and self.result() != 0:
+    def _found(self, cands, gen):
+        if gen != self.generation or self.closed:
             return
         self.cands = cands
         self.status.setText(tr("cover.found", n=len(cands)) if cands else tr("msg.nothing_found"))
@@ -112,38 +119,57 @@ class CoverPicker(Dialog):
             it.setData(Qt.UserRole, i)
             it.setToolTip(c["label"])
             self.grid.addItem(it)
-            cm_online.run(cm_online.download, c["thumb"], done=lambda data, it=it: self._thumb(it, data))
+            cm_online.run(cm_online.download, c["thumb"], done=lambda data, i=i: self._thumb(i, data, gen))
         if cands:
             self.grid.setCurrentRow(0)
 
-    def _thumb(self, it, data):
-        try:
-            img = QImage.fromData(data)
-            if not img.isNull():
-                it.setIcon(QIcon(QPixmap.fromImage(img.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation))))
-                c = self.cands[it.data(Qt.UserRole)]
-                c["size"] = f"{img.width()}×{img.height()}"
-        except RuntimeError:
-            pass
+    def _thumb(self, i, data, gen):
+        if gen != self.generation or self.closed or i >= self.grid.count():
+            return
+        img = QImage.fromData(data or b"")
+        if img.isNull():
+            return
+        it = self.grid.item(i)
+        it.setIcon(QIcon(QPixmap.fromImage(img.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation))))
+        self.cands[i]["size"] = f"{img.width()}×{img.height()}"
+        it.setText(f'{self.cands[i]["source"]} · {img.width()}×{img.height()}\n{self.cands[i]["label"]}')
 
     def accept_choice(self):
         it = self.grid.currentItem()
-        if not it:
+        if not it or self.busy:
             return
-        c = self.cands[it.data(Qt.UserRole)]
+        i = it.data(Qt.UserRole)
+        if not (0 <= i < len(self.cands)):
+            return
+        c = self.cands[i]
+        self.busy = True
         self.ok.setEnabled(False)
         self.status.setText(tr("msg.downloading"))
 
         def got(data):
+            if self.closed:
+                return
+            img = QImage.fromData(data or b"")
+            if img.isNull():
+                fail(tr("msg.not_image"))
+                return
             self.result_data = data
             self.accept()
 
         def fail(msg):
+            if self.closed:
+                return
+            self.busy = False
             self.ok.setEnabled(True)
             self.status.setText(tr("msg.online_error", error=msg))
-            # full size missing on the server: fall back to the thumbnail
-        cm_online.run(cm_online.download, c["url"], done=got, failed=lambda m: cm_online.run(
-            cm_online.download, c["thumb"], done=got, failed=fail))
+        # full size missing on the server: fall back to the thumbnail
+        cm_online.run(cm_online.download, c["url"], done=got,
+                      failed=lambda m: not self.closed and cm_online.run(cm_online.download, c["thumb"], done=got,
+                                                                         failed=fail))
+
+    def done(self, r):
+        self.closed = True
+        super().done(r)
 
 
 # ------------------------------------------------------------------ MusicBrainz picker
@@ -505,9 +531,12 @@ class TagEditor(Dialog):
             return
         dlg = CoverPicker(self, self._val("albumartist") or self._val("artist") or self.infos[0]["artist"],
                           self._val("album") or self.infos[0]["album"], self._val("title"))
-        if dlg.exec() and dlg.result_data:
-            img = QImage.fromData(dlg.result_data)
-            self.new_cover = _to_jpeg(img) if not img.isNull() else dlg.result_data
+        ok = dlg.exec()
+        data = dlg.result_data
+        dlg.deleteLater()
+        if ok and data:
+            img = QImage.fromData(data)
+            self.new_cover = _to_jpeg(img) if not img.isNull() else data
             self._show_cover(self.new_cover)
 
     def cover_remove(self):

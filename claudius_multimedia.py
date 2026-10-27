@@ -6,7 +6,44 @@ Start:  python claudius_multimedia.py [files or folders to play]
 import os
 import sys
 
-from cm_core import APP_NAME, APP_VERSION, APP_AUTHORS, resource_dir, set_language, settings, system_language, tr
+from cm_core import (APP_NAME, APP_VERSION, APP_AUTHORS, data_dir, resource_dir, set_language, settings,
+                     system_language, tr)
+
+_log_file = None
+
+
+def _setup_log():
+    """Errors go to %APPDATA%\\Claudius Multimedia\\claudius.log (the built program has no console window).
+    A Python error inside the program is written there and the program keeps running; if the program ever
+    crashes outright, faulthandler writes where it happened."""
+    global _log_file
+    import faulthandler
+    import time
+    import traceback
+    path = os.path.join(data_dir(), "claudius.log")
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 1024 * 1024:
+            os.replace(path, path + ".old")
+        _log_file = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    _log_file.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {APP_NAME} {APP_VERSION}  {sys.platform} =====\n")
+    if sys.stderr is None or getattr(sys, "frozen", False):
+        sys.stderr = _log_file
+        sys.stdout = _log_file
+    try:
+        faulthandler.enable(_log_file, all_threads=True)
+    except Exception:
+        pass
+
+    def hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb, file=_log_file)
+    sys.excepthook = hook
+    threading_hook = getattr(__import__("threading"), "excepthook", None)
+    if threading_hook is not None:
+        import threading
+        threading.excepthook = lambda a: traceback.print_exception(a.exc_type, a.exc_value, a.exc_traceback,
+                                                                   file=_log_file)
 
 SERVER_NAME = "ClaudiusMultimedia-" + (os.environ.get("USERNAME") or os.environ.get("USER") or "user")
 
@@ -143,6 +180,7 @@ def _selftest(app, window, report):
 
 
 def main():
+    _setup_log()
     if sys.platform == "win32":
         try:
             import ctypes

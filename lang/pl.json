@@ -222,5 +222,6 @@
   "stats.tracks": "Utwory", "stats.videos": "Filmy", "tab.tools": "Narzędzia", "tag.bad_track": "Numer utworu: wpisz 3 lub 3/12",
   "tag.bad_year": "Rok: cztery cyfry, np. 2024", "tag.cannot_write": "W tym typie pliku nie można zapisać tagów.",
   "act.browse_folders": "Foldery",
-  "sc.start_over": "Odtwórz film od początku", "sc.rename": "Zmień tytuł (biblioteka)"
+  "sc.start_over": "Odtwórz film od początku", "sc.rename": "Zmień tytuł (biblioteka)",
+  "msg.not_image": "Pobrany plik nie jest obrazem. Wybierz inną okładkę."
 }

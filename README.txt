@@ -1,4 +1,4 @@
-Claudius Multimedia 1.1.0 - music & video player for Windows 11 (64-bit)
+Claudius Multimedia 1.1.1 - music & video player for Windows 11 (64-bit)
 Created by Michal Czapla & Claude AI.  Freeware (GNU GPL v3).
 https://github.com/ClaudiusCoder79/Claudius-Multimedia
 
@@ -52,6 +52,7 @@ KEYBOARD
 WHERE THINGS ARE KEPT
   Program:  C:\Program Files (x86)\Claudius Multimedia
   Settings, library database, cover cache:  %APPDATA%\Claudius Multimedia
+  Error log (send it if the program misbehaves):  %APPDATA%\Claudius Multimedia\claudius.log
   Video snapshots:  Pictures\Claudius Multimedia (change it in Settings > Playback)
   Translations:  lang\*.json in the program folder (en, pl, de, fr, it, es)
 

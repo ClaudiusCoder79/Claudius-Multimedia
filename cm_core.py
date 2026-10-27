@@ -4,7 +4,7 @@ import os
 import sys
 
 APP_NAME = "Claudius Multimedia"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_AUTHORS = "Michal Czapla & Claude AI"
 APP_URL = "https://github.com/ClaudiusCoder79/Claudius-Multimedia"
 USER_AGENT = f"ClaudiusMultimedia/{APP_VERSION} ( {APP_URL} )"

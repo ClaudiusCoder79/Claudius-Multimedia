@@ -218,5 +218,6 @@
   "stats.tracks": "Tracks", "stats.videos": "Videos", "tab.tools": "Tools", "tag.bad_track": "Track number: use 3 or 3/12",
   "tag.bad_year": "Year: use four digits, e.g. 2024", "tag.cannot_write": "Tags can't be saved in this file type.",
   "act.browse_folders": "Folders",
-  "sc.start_over": "Start the video from the beginning", "sc.rename": "Rename the title (library)"
+  "sc.start_over": "Start the video from the beginning", "sc.rename": "Rename the title (library)",
+  "msg.not_image": "The downloaded file is not a picture. Try another cover."
 }

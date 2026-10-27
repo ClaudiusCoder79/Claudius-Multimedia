@@ -223,5 +223,6 @@
   "stats.tracks": "Titres", "stats.videos": "Vidéos", "tab.tools": "Outils", "tag.bad_track": "Numéro de piste : saisissez 3 ou 3/12",
   "tag.bad_year": "Année : quatre chiffres, ex. 2024", "tag.cannot_write": "Les tags ne peuvent pas être enregistrés dans ce type de fichier.",
   "act.browse_folders": "Dossiers",
-  "sc.start_over": "Recommencer la vidéo depuis le début", "sc.rename": "Renommer le titre (bibliothèque)"
+  "sc.start_over": "Recommencer la vidéo depuis le début", "sc.rename": "Renommer le titre (bibliothèque)",
+  "msg.not_image": "Le fichier téléchargé n'est pas une image. Essayez une autre pochette."
 }

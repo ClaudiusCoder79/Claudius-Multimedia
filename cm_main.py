@@ -2507,10 +2507,15 @@ class MainWindow(QMainWindow):
         info = cm_tags.read(paths[0])
         dlg = cm_dialogs.CoverPicker(self, info.get("albumartist") or info.get("artist", ""), info.get("album", ""),
                                      info.get("title", ""))
-        if dlg.exec() and dlg.result_data:
-            img = QImage.fromData(dlg.result_data)
-            data = cm_dialogs._to_jpeg(img) if not img.isNull() else dlg.result_data
-            self._apply_cover(paths, data)
+        ok = dlg.exec()
+        data = dlg.result_data
+        dlg.deleteLater()
+        if ok and data:
+            img = QImage.fromData(data)
+            if img.isNull():
+                QMessageBox.warning(self, APP_NAME, tr("msg.not_image"))
+                return
+            self._apply_cover(paths, cm_dialogs._to_jpeg(img))
 
     def _apply_cover(self, paths, data):
         errors = []

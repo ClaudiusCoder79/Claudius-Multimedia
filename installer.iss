@@ -8,7 +8,7 @@
 ;   - installer in English, Polish, German, French, Italian and Spanish; the chosen language is passed to the program
 
 #define MyAppName "Claudius Multimedia"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppExe "Claudius Multimedia.exe"
 #define MyAppURL "https://github.com/ClaudiusCoder79/Claudius-Multimedia"
 #if FileExists("dist\Claudius Multimedia\Claudius Multimedia.exe")
